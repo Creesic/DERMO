@@ -13,6 +13,13 @@ pub const DBC_FILE_FILTERS: &[(&str, &[&str])] = &[
     ("All Files", &["*"]),
 ];
 
+/// Supported file types for wideband firmware
+pub const FIRMWARE_FILE_FILTERS: &[(&str, &[&str])] = &[
+    ("Firmware binary", &["bin"]),
+    ("SREC firmware", &["srec", "s19"]),
+    ("All Files", &["*"]),
+];
+
 /// File dialog helper for S.H.I.T
 pub struct FileDialogs;
 
@@ -43,6 +50,16 @@ impl FileDialogs {
             .save_file()
     }
 
+    /// Open a file dialog for selecting wideband firmware (.bin or .srec)
+    pub fn open_firmware_file() -> Option<PathBuf> {
+        FileDialog::new()
+            .add_filter("Firmware binary", &["bin"])
+            .add_filter("SREC firmware", &["srec", "s19"])
+            .add_filter("All Files", &["*"])
+            .set_title("Select Wideband Firmware")
+            .pick_file()
+    }
+
     /// Open a file dialog for exporting data
     pub fn export_csv_file() -> Option<PathBuf> {
         FileDialog::new()
@@ -60,6 +77,25 @@ impl FileDialogs {
             .add_filter("All Files", &["*"])
             .set_title("Open CAN Log Files")
             .pick_files()
+    }
+
+    /// Save savestate file
+    pub fn save_savestate_file() -> Option<PathBuf> {
+        FileDialog::new()
+            .add_filter("Savestate", &["json"])
+            .add_filter("All Files", &["*"])
+            .set_title("Save Savestate")
+            .set_file_name("savestate.json")
+            .save_file()
+    }
+
+    /// Open savestate file
+    pub fn open_savestate_file() -> Option<PathBuf> {
+        FileDialog::new()
+            .add_filter("Savestate", &["json"])
+            .add_filter("All Files", &["*"])
+            .set_title("Load Savestate")
+            .pick_file()
     }
 }
 

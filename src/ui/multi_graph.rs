@@ -230,6 +230,26 @@ impl MultiSignalGraph {
         self.selected_signals.remove(key);
     }
 
+    /// Restore chart signals from savestate (keys like "signal@bus0")
+    pub fn restore_signals(&mut self, keys: &[String]) {
+        for key in keys {
+            if self.series.contains_key(key) {
+                continue;
+            }
+            if let Some(pos) = key.find("@bus") {
+                let name = &key[..pos];
+                let bus_str = &key[pos + 4..];
+                if let Ok(bus) = bus_str.parse::<u8>() {
+                    if let Some(template) = self.available_signals.iter().find(|s| s.name == name) {
+                        let mut info = template.clone();
+                        info.bus = bus;
+                        self.add_signal(&info);
+                    }
+                }
+            }
+        }
+    }
+
     /// Add a data point to a series
     pub fn add_point(&mut self, key: &str, value: f64, timestamp: DateTime<Utc>) {
         if let Some(series) = self.series.get_mut(key) {

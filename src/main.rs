@@ -63,6 +63,8 @@ struct AppState {
     dbc_loaded: bool,
     show_file_open_pending: bool,
     show_dbc_open_pending: bool,
+    show_save_savestate_pending: bool,
+    show_load_savestate_pending: bool,
     status_message: Option<String>,
     // Incremental chart data loading
     pending_signal_loads: std::collections::HashMap<String, usize>,  // signal_name -> current message index
@@ -80,6 +82,14 @@ struct AppState {
     show_bit_visualizer: bool,
     // Log window
     show_log: bool,
+    // Recently opened files (paths)
+    recent_can_files: Vec<String>,
+    recent_dbc_files: Vec<String>,
+    recent_savestates: Vec<String>,
+    // Savestate loading: apply when CAN load completes
+    pending_savestate: Option<Savestate>,
+    // Layout to apply next frame (needs imgui context)
+    pending_layout_apply: Option<String>,
     // CAN hardware manager
     can_collection: CanManagerCollection,
     // Plugins
@@ -96,8 +106,46 @@ struct AppState {
 /// Messages for async loading
 enum LoadingUpdate {
     Progress(usize, usize),
-    Complete(Vec<CanMessage>),
+    Complete(Vec<CanMessage>, String),
     Error(String),
+}
+
+/// Savestate: snapshot of window layout, chart signals, bit visualizer quadrants, and file paths
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Savestate {
+    #[serde(default)]
+    can_file_path: Option<String>,
+    #[serde(default)]
+    dbc_file_path: Option<String>,
+    #[serde(default)]
+    chart_signals: Vec<String>,
+    /// Each quadrant: (msg_id, bus) or None for empty
+    #[serde(default)]
+    bit_visualizer_quadrants: Vec<(u32, u8)>,
+    /// Playback position 0.0-1.0
+    #[serde(default)]
+    playback_position: Option<f32>,
+    #[serde(default)]
+    show_messages: bool,
+    #[serde(default)]
+    show_charts: bool,
+    #[serde(default)]
+    show_bit_visualizer: bool,
+    #[serde(default)]
+    show_hardware_manager: bool,
+    #[serde(default)]
+    show_live_messages: bool,
+    #[serde(default)]
+    show_message_sender: bool,
+    #[serde(default)]
+    show_message_stats: bool,
+    #[serde(default)]
+    show_pattern_analyzer: bool,
+    #[serde(default)]
+    show_log: bool,
+    /// ImGui layout INI content
+    #[serde(default)]
+    layout_ini: String,
 }
 
 /// Persistent application settings
@@ -113,7 +161,15 @@ struct AppSettings {
     show_shortcuts: bool,
     show_bit_visualizer: bool,
     show_log: bool,
+    #[serde(default)]
+    recent_can_files: Vec<String>,
+    #[serde(default)]
+    recent_dbc_files: Vec<String>,
+    #[serde(default)]
+    recent_savestates: Vec<String>,
 }
+
+const MAX_RECENT_FILES: usize = 10;
 
 impl AppSettings {
     fn config_path() -> Option<PathBuf> {
@@ -181,6 +237,8 @@ impl AppState {
             dbc_loaded: false,
             show_file_open_pending: false,
             show_dbc_open_pending: false,
+            show_save_savestate_pending: false,
+            show_load_savestate_pending: false,
             status_message: None,
             pending_signal_loads: std::collections::HashMap::new(),
             // Window visibility from settings
@@ -197,6 +255,12 @@ impl AppState {
             show_bit_visualizer: settings.show_bit_visualizer,
             // Log window
             show_log: settings.show_log,
+            // Recently opened files
+            recent_can_files: settings.recent_can_files,
+            recent_dbc_files: settings.recent_dbc_files,
+            recent_savestates: settings.recent_savestates,
+            pending_savestate: None,
+            pending_layout_apply: None,
             // CAN hardware manager
             can_collection: CanManagerCollection::new(),
             // Plugins
@@ -223,8 +287,39 @@ impl AppState {
             show_shortcuts: self.show_shortcuts,
             show_bit_visualizer: self.show_bit_visualizer,
             show_log: self.show_log,
+            recent_can_files: self.recent_can_files.clone(),
+            recent_dbc_files: self.recent_dbc_files.clone(),
+            recent_savestates: self.recent_savestates.clone(),
         };
         settings.save();
+    }
+
+    fn add_recent_can_file(&mut self, path: &str) {
+        let path = std::path::Path::new(path)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or_else(|| path.to_string());
+        self.recent_can_files.retain(|p| p != &path);
+        self.recent_can_files.insert(0, path);
+        if self.recent_can_files.len() > MAX_RECENT_FILES {
+            self.recent_can_files.truncate(MAX_RECENT_FILES);
+        }
+        self.save_settings();
+    }
+
+    fn add_recent_dbc_file(&mut self, path: &str) {
+        let path = std::path::Path::new(path)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or_else(|| path.to_string());
+        self.recent_dbc_files.retain(|p| p != &path);
+        self.recent_dbc_files.insert(0, path);
+        if self.recent_dbc_files.len() > MAX_RECENT_FILES {
+            self.recent_dbc_files.truncate(MAX_RECENT_FILES);
+        }
+        self.save_settings();
     }
 
     fn load_file(&mut self, path: &str) {
@@ -249,7 +344,7 @@ impl AppState {
                             let _ = tx.send(LoadingUpdate::Progress(i, total));
                         }
                     }
-                    let _ = tx.send(LoadingUpdate::Complete(messages));
+                    let _ = tx.send(LoadingUpdate::Complete(messages, path));
                 }
                 Err(e) => {
                     let _ = tx.send(LoadingUpdate::Error(e.to_string()));
@@ -284,8 +379,11 @@ impl AppState {
                         self.loading_progress, current, total
                     ));
                 }
-                LoadingUpdate::Complete(messages) => {
-                    self.finish_loading(messages);
+                LoadingUpdate::Complete(messages, path) => {
+                    self.finish_loading(messages, &path);
+                    if let Some(savestate) = self.pending_savestate.take() {
+                        self.apply_savestate(&savestate);
+                    }
                     self.loading = false;
                     done = true;
                     should_restore = false;
@@ -309,7 +407,8 @@ impl AppState {
     }
 
     /// Finish loading after background thread completes
-    fn finish_loading(&mut self, messages: Vec<CanMessage>) {
+    fn finish_loading(&mut self, messages: Vec<CanMessage>, path: &str) {
+        self.add_recent_can_file(path);
         let msg_count = messages.len();
         self.messages = messages.clone();
         self.playback = PlaybackEngine::new(messages.clone());
@@ -451,6 +550,7 @@ impl AppState {
     fn load_dbc(&mut self, path: &str) {
         match DbcFile::load(path) {
             Ok(dbc) => {
+                self.add_recent_dbc_file(path);
                 self.signal_decoder.set_dbc(dbc.clone());
                 self.dbc_file = dbc.clone();
                 self.message_list.set_dbc(dbc.clone());
@@ -502,6 +602,175 @@ impl AppState {
             }
             self.show_dbc_open_pending = false;
         }
+
+        // Handle load savestate dialog
+        if self.show_load_savestate_pending {
+            if let Some(path) = FileDialogs::open_savestate_file() {
+                self.load_savestate(path.to_str().unwrap_or(""));
+            }
+            self.show_load_savestate_pending = false;
+        }
+    }
+
+    fn process_savestate_save(&mut self, imgui: &mut imgui::Context) {
+        if !self.show_save_savestate_pending {
+            return;
+        }
+        self.show_save_savestate_pending = false;
+        if let Some(path) = FileDialogs::save_savestate_file() {
+            let mut layout_ini = String::new();
+            imgui.save_ini_settings(&mut layout_ini);
+
+            let can_path = if self.file_loaded {
+                self.recent_can_files.first().cloned()
+            } else {
+                None
+            };
+            let dbc_path = if self.dbc_loaded {
+                self.recent_dbc_files.first().cloned()
+            } else {
+                None
+            };
+
+            let playback_pos = self.playback.current_time().and_then(|ct| {
+                let messages = &self.messages;
+                if messages.is_empty() {
+                    return None;
+                }
+                let (first, last) = (messages.first()?, messages.last()?);
+                let total = (last.timestamp - first.timestamp).num_milliseconds() as f64;
+                if total <= 0.0 {
+                    return None;
+                }
+                let elapsed = (ct - first.timestamp).num_milliseconds() as f64;
+                Some((elapsed / total) as f32)
+            });
+
+            let savestate = Savestate {
+                can_file_path: can_path,
+                dbc_file_path: dbc_path,
+                chart_signals: self.charts.get_charted_signals(),
+                bit_visualizer_quadrants: self.bit_visualizer.get_quadrant_selections(),
+                playback_position: playback_pos,
+                show_messages: self.show_messages,
+                show_charts: self.show_charts,
+                show_bit_visualizer: self.show_bit_visualizer,
+                show_hardware_manager: self.show_hardware_manager,
+                show_live_messages: self.show_live_messages,
+                show_message_sender: self.show_message_sender,
+                show_message_stats: self.show_message_stats,
+                show_pattern_analyzer: self.show_pattern_analyzer,
+                show_log: self.show_log,
+                layout_ini,
+            };
+
+            if let Ok(json) = serde_json::to_string_pretty(&savestate) {
+                if fs::write(&path, json).is_ok() {
+                    self.add_recent_savestate(path.to_str().unwrap_or(""));
+                    self.status_message = Some("Savestate saved".to_string());
+                } else {
+                    self.status_message = Some("Failed to write savestate".to_string());
+                }
+            } else {
+                self.status_message = Some("Failed to serialize savestate".to_string());
+            }
+        }
+    }
+
+    fn add_recent_savestate(&mut self, path: &str) {
+        let path = std::path::Path::new(path)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or_else(|| path.to_string());
+        self.recent_savestates.retain(|p| p != &path);
+        self.recent_savestates.insert(0, path);
+        if self.recent_savestates.len() > MAX_RECENT_FILES {
+            self.recent_savestates.truncate(MAX_RECENT_FILES);
+        }
+        self.save_settings();
+    }
+
+    fn load_savestate(&mut self, path: &str) {
+        let contents = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.status_message = Some("Failed to read savestate file".to_string());
+                return;
+            }
+        };
+        let savestate: Savestate = match serde_json::from_str(&contents) {
+            Ok(s) => s,
+            Err(_) => {
+                self.status_message = Some("Invalid savestate format".to_string());
+                return;
+            }
+        };
+
+        self.add_recent_savestate(path);
+
+        // Load DBC first (needed for chart signals)
+        if let Some(ref dbc_path) = savestate.dbc_file_path {
+            if std::path::Path::new(dbc_path).exists() {
+                self.load_dbc(dbc_path);
+            }
+        }
+
+        // Load CAN file if present (async)
+        if let Some(ref can_path) = savestate.can_file_path {
+            if std::path::Path::new(can_path).exists() {
+                let path = can_path.clone();
+                self.pending_savestate = Some(savestate);
+                self.load_file(&path);
+                return;
+            }
+        }
+
+        // No CAN file or path missing - apply savestate immediately
+        self.apply_savestate(&savestate);
+    }
+
+    fn apply_savestate(&mut self, savestate: &Savestate) {
+        // Window visibility
+        self.show_messages = savestate.show_messages;
+        self.show_charts = savestate.show_charts;
+        self.show_bit_visualizer = savestate.show_bit_visualizer;
+        self.show_hardware_manager = savestate.show_hardware_manager;
+        self.show_live_messages = savestate.show_live_messages;
+        self.show_message_sender = savestate.show_message_sender;
+        self.show_message_stats = savestate.show_message_stats;
+        self.show_pattern_analyzer = savestate.show_pattern_analyzer;
+        self.show_log = savestate.show_log;
+
+        // Chart signals (requires DBC to be loaded)
+        if self.dbc_loaded {
+            self.charts.restore_signals(&savestate.chart_signals);
+            if self.file_loaded {
+                self.populate_chart_data();
+            }
+        }
+
+        // Bit visualizer quadrants
+        self.bit_visualizer.set_quadrant_selections(&savestate.bit_visualizer_quadrants);
+
+        // Playback position
+        if let (Some(pos), Some(first), Some(last)) = (
+            savestate.playback_position,
+            self.messages.first(),
+            self.messages.last(),
+        ) {
+            let total_ms = (last.timestamp - first.timestamp).num_milliseconds() as f64;
+            let offset_ms = (pos as f64 * total_ms) as i64;
+            let target = first.timestamp + chrono::Duration::milliseconds(offset_ms);
+            self.playback.seek_to_time(Some(target));
+        }
+
+        // Layout - apply next frame (needs imgui)
+        if !savestate.layout_ini.is_empty() {
+            self.pending_layout_apply = Some(savestate.layout_ini.clone());
+        }
+
+        self.status_message = Some("Savestate loaded".to_string());
     }
 
     fn update_graphs(&mut self) {
@@ -537,6 +806,14 @@ impl AppState {
 fn main() {
     // Initialize logging: console (stderr), file, and in-app buffer
     logging::init();
+
+    // Install panic hook to capture panics to log file
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        tracing::error!("PANIC: {}", panic_info);
+        default_hook(panic_info);
+    }));
+
     info!("S.H.I.T v{} starting", env!("CARGO_PKG_VERSION"));
 
     // Create tokio runtime for async operations
@@ -681,6 +958,12 @@ fn main() {
             Event::AboutToWait => {
                 // Process file dialogs
                 state.process_file_dialogs();
+                state.process_savestate_save(&mut imgui);
+
+                // Apply pending layout from savestate load
+                if let Some(layout) = state.pending_layout_apply.take() {
+                    imgui.load_ini_settings(&layout);
+                }
 
                 // Process async loading
                 state.process_loading();
@@ -740,6 +1023,76 @@ fn main() {
                         }
                         if ui.menu_item("Load DBC...") {
                             state.show_dbc_open_pending = true;
+                        }
+                        ui.separator();
+                        if let Some(_menu) = ui.begin_menu("Recently opened") {
+                            let has_recent = !state.recent_can_files.is_empty() || !state.recent_dbc_files.is_empty();
+                            if !has_recent {
+                                ui.text_disabled("No recent files");
+                            } else {
+                                for path in state.recent_can_files.clone() {
+                                    let display = std::path::Path::new(&path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(&path)
+                                        .to_string();
+                                    let label = format!("{}##can_{}", display, path);
+                                    if std::path::Path::new(&path).exists() {
+                                        if ui.menu_item(&label) {
+                                            state.load_file(&path);
+                                        }
+                                    } else {
+                                        ui.text_disabled(&format!("{} (missing)", display));
+                                    }
+                                }
+                                if !state.recent_can_files.is_empty() && !state.recent_dbc_files.is_empty() {
+                                    ui.separator();
+                                }
+                                for path in state.recent_dbc_files.clone() {
+                                    let display = std::path::Path::new(&path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(&path)
+                                        .to_string();
+                                    let label = format!("{}##dbc_{}", display, path);
+                                    if std::path::Path::new(&path).exists() {
+                                        if ui.menu_item(&label) {
+                                            state.load_dbc(&path);
+                                        }
+                                    } else {
+                                        ui.text_disabled(&format!("{} (missing)", display));
+                                    }
+                                }
+                            }
+                        }
+                        ui.separator();
+                        ui.separator();
+                        if ui.menu_item("Save Savestate...") {
+                            state.show_save_savestate_pending = true;
+                        }
+                        if ui.menu_item("Load Savestate...") {
+                            state.show_load_savestate_pending = true;
+                        }
+                        if let Some(_menu) = ui.begin_menu("Recent Savestates") {
+                            if state.recent_savestates.is_empty() {
+                                ui.text_disabled("No recent savestates");
+                            } else {
+                                for path in state.recent_savestates.clone() {
+                                    let display = std::path::Path::new(&path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(&path)
+                                        .to_string();
+                                    let label = format!("{}##savestate_{}", display, path);
+                                    if std::path::Path::new(&path).exists() {
+                                        if ui.menu_item(&label) {
+                                            state.load_savestate(&path);
+                                        }
+                                    } else {
+                                        ui.text_disabled(&format!("{} (missing)", display));
+                                    }
+                                }
+                            }
                         }
                         ui.separator();
                         if state.file_loaded {
@@ -947,7 +1300,7 @@ fn main() {
                 // Windows can be rearranged by dragging their tabs/bars
 
                 if state.show_messages {
-                    state.message_list.render(&ui, &mut state.show_messages);
+                    state.message_list.render(&ui, &mut state.show_messages, state.playback.is_playing());
                 }
 
                 if state.show_charts {
@@ -1212,6 +1565,12 @@ fn main() {
                     .filter(|i| matches!(i.status, hardware::can_manager::ConnectionStatus::Connected))
                     .map(|i| i.bus_id)
                     .collect();
+                let connected_interfaces: Vec<(u8, String)> = state.hardware_manager.state()
+                    .connected_interfaces
+                    .iter()
+                    .filter(|i| matches!(i.status, hardware::can_manager::ConnectionStatus::Connected))
+                    .map(|i| (i.bus_id, i.interface_name.clone()))
+                    .collect();
                 let is_connected = state.hardware_manager.state().is_active;
 
                 let plugin_ids: Vec<String> = state.plugin_registry.plugins()
@@ -1223,6 +1582,7 @@ fn main() {
                             queue_send: &mut state.plugin_send_queue,
                             is_connected,
                             connected_buses: &connected_buses,
+                            connected_interfaces: &connected_interfaces,
                         };
                         state.plugin_registry.render_plugin(id, &ui, &mut ctx, &live_messages);
                     }
@@ -1255,13 +1615,18 @@ fn main() {
                     state.pattern_analyzer.render(&ui, &mut state.show_pattern_analyzer);
                 }
 
-                // Bit Visualizer window - update with selected message
+                // Bit Visualizer window - update with message data
                 if state.show_bit_visualizer {
-                    // Update visualizer with currently selected message from message list
-                    let selected = state.message_list.selected_message();
-
-                    if let Some(selected_msg) = selected {
+                    // Selection: set focused quadrant when user selects from message list
+                    if let Some(selected_msg) = state.message_list.selected_message() {
                         state.bit_visualizer.set_message(selected_msg.id, selected_msg.bus, &selected_msg.data);
+                    }
+
+                    // Playback: update ALL quadrants with latest data for their respective messages
+                    for (id, bus) in state.bit_visualizer.quadrant_messages() {
+                        if let Some(msg_state) = state.message_list.get_state(id, bus) {
+                            state.bit_visualizer.update_message_data(id, bus, &msg_state.data);
+                        }
                     }
 
                     // Get list of charted signals

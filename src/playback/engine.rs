@@ -165,7 +165,13 @@ impl PlaybackEngine {
                     .map(|m| m.timestamp)
                     .unwrap_or(real_start);
                 let elapsed_so_far = (current_time - real_start).num_milliseconds() as f64 / 1000.0;
-                let elapsed_instant = StdDuration::from_secs_f64(elapsed_so_far / self.config.speed);
+                if elapsed_so_far < 0.0 {
+                    // Seeked backward past real_start - restart timing from current position
+                    self.real_start_time = Some(current_time);
+                }
+                // Clamp to 0: Duration::from_secs_f64 panics on negative
+                let elapsed_secs = (elapsed_so_far / self.config.speed).max(0.0);
+                let elapsed_instant = StdDuration::from_secs_f64(elapsed_secs);
                 self.virtual_start_time = Some(Instant::now() - elapsed_instant);
             }
         }
