@@ -1,6 +1,8 @@
+pub mod cabana;
 pub mod csv;
 pub mod rlog;
 
+pub use cabana::{load_cabana_rlog, load_cabana_rlog_with_progress, load_cabana_session};
 pub use csv::{load_csv, load_csv_with_progress, load_csv_streaming, ProgressCallback, ChunkCallback};
 pub use rlog::load_rlog;
 
@@ -12,14 +14,20 @@ use crate::core::CanMessage;
 pub enum InputFormat {
     Csv,
     Rlog,
+    CabanaRlog,
     Unknown,
 }
 
 /// Detect the format of an input file by checking the file header/magic
 pub fn detect_format(data: &[u8]) -> InputFormat {
-    // rlog files start with a specific magic bytes pattern
-    if is_rlog(data) {
+    // bzip2 compressed rlog (openpilot standard)
+    if is_rlog_bz2(data) {
         return InputFormat::Rlog;
+    }
+
+    // Cabana/uncompressed rlog: Cap'n Proto stream (segment table)
+    if is_cabana_rlog(data) {
+        return InputFormat::CabanaRlog;
     }
 
     // Check if it looks like CSV (text, comma separated)
@@ -30,10 +38,18 @@ pub fn detect_format(data: &[u8]) -> InputFormat {
     InputFormat::Unknown
 }
 
-fn is_rlog(data: &[u8]) -> bool {
-    // comma's rlog format starts with "bz" magic
-    // This is a simplified check - real implementation would verify the full header
-    data.len() >= 2 && data[0] == b'b' && data[1] == b'z'
+fn is_rlog_bz2(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == b'B' && data[1] == b'Z'
+}
+
+/// Cabana rlog: uncompressed Cap'n Proto. First 4 bytes = (segment_count-1), typically 0 for 1 segment.
+fn is_cabana_rlog(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return false;
+    }
+    let seg_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize + 1;
+    // Sanity: 1-64 segments, next 4 bytes = segment size in words (reasonable)
+    seg_count >= 1 && seg_count <= 64
 }
 
 fn is_csv(data: &[u8]) -> bool {
@@ -71,7 +87,9 @@ pub fn load_file_with_progress(
 
     match detect_format(&header) {
         InputFormat::Csv => load_csv_with_progress(path, progress_cb),
-        InputFormat::Rlog => load_rlog(path),
+        InputFormat::Rlog | InputFormat::CabanaRlog => {
+            load_cabana_rlog_with_progress(path, progress_cb)
+        }
         InputFormat::Unknown => anyhow::bail!("Unknown input format"),
     }
 }
@@ -89,9 +107,9 @@ pub fn load_file_streaming(
 
     match detect_format(&header) {
         InputFormat::Csv => load_csv_streaming(path, chunk_cb, progress_cb),
-        InputFormat::Rlog => {
-            // rlog doesn't support streaming - fall back to full load
-            let messages = load_rlog(path)?;
+        InputFormat::Rlog | InputFormat::CabanaRlog => {
+            // rlog/cabana don't support streaming - fall back to full load
+            let messages = load_cabana_rlog(path)?;
             chunk_cb(messages);
             Ok(())
         }

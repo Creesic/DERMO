@@ -63,6 +63,7 @@ struct AppState {
     file_loaded: bool,
     dbc_loaded: bool,
     show_file_open_pending: bool,
+    show_cabana_folder_pending: bool,
     show_dbc_open_pending: bool,
     show_save_savestate_pending: bool,
     show_load_savestate_pending: bool,
@@ -245,6 +246,7 @@ impl AppState {
             file_loaded: false,
             dbc_loaded: false,
             show_file_open_pending: false,
+            show_cabana_folder_pending: false,
             show_dbc_open_pending: false,
             show_save_savestate_pending: false,
             show_load_savestate_pending: false,
@@ -371,6 +373,42 @@ impl AppState {
             match input::load_file_streaming(&path, chunk_cb, progress_cb) {
                 Ok(()) => {
                     let _ = tx_complete.send(LoadingUpdate::Complete(path));
+                }
+                Err(e) => {
+                    let _ = tx_complete.send(LoadingUpdate::Error(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn load_cabana_folder(&mut self, folder_path: &str) {
+        self.messages.clear();
+        self.playback = PlaybackEngine::new(Vec::new());
+        self.message_list.set_messages(Vec::new());
+        self.file_loaded = false;
+        self.pending_signal_loads.clear();
+        self.charts.clear_data();
+        self.charts.clear_time_range();
+        self.message_stats.clear();
+        self.pattern_analyzer.clear();
+
+        self.loading = true;
+        self.loading_progress = 0.0;
+        self.loading_total = 0;
+        self.status_message = Some(format!("Loading Cabana session {}...", folder_path));
+
+        let folder_path = folder_path.to_string();
+        let (tx, rx) = channel();
+        self.loading_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let tx_chunk = tx.clone();
+            let tx_complete = tx.clone();
+
+            match input::load_cabana_session(&folder_path) {
+                Ok(msgs) => {
+                    let _ = tx_chunk.send(LoadingUpdate::Chunk(msgs));
+                    let _ = tx_complete.send(LoadingUpdate::Complete(folder_path));
                 }
                 Err(e) => {
                     let _ = tx_complete.send(LoadingUpdate::Error(e.to_string()));
@@ -695,6 +733,13 @@ impl AppState {
             self.show_file_open_pending = false;
         }
 
+        if self.show_cabana_folder_pending {
+            if let Some(path) = FileDialogs::open_cabana_session_folder() {
+                self.load_cabana_folder(path.to_str().unwrap_or(""));
+            }
+            self.show_cabana_folder_pending = false;
+        }
+
         // Handle DBC open dialog
         if self.show_dbc_open_pending {
             if let Some(path) = FileDialogs::open_dbc_file() {
@@ -929,7 +974,8 @@ fn main() {
                 .with_title("S.H.I.T - Signal Harvesting & Interpretation Toolkit")
                 .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
         ))
-        .build(&event_loop, glutin::config::ConfigTemplateBuilder::new(), |mut iter| {
+        .build(&event_loop, glutin::config::ConfigTemplateBuilder::new()
+            .prefer_hardware_accelerated(Some(true)), |mut iter| {
             iter.next().unwrap()
         })
         .expect("Failed to create window and display");
@@ -1124,8 +1170,14 @@ fn main() {
                         if ui.menu_item("Open CAN Log...") {
                             state.show_file_open_pending = true;
                         }
+                        if ui.menu_item("Open Cabana Session...") {
+                            state.show_cabana_folder_pending = true;
+                        }
                         if ui.menu_item("Load DBC...") {
                             state.show_dbc_open_pending = true;
+                        }
+                        if ui.menu_item("Export to CSV...") {
+                            state.export_dialog.show();
                         }
                         ui.separator();
                         if let Some(_menu) = ui.begin_menu("Recently opened") {
@@ -1142,7 +1194,11 @@ fn main() {
                                     let label = format!("{}##can_{}", display, path);
                                     if std::path::Path::new(&path).exists() {
                                         if ui.menu_item(&label) {
-                                            state.load_file(&path);
+                                            if std::path::Path::new(&path).is_dir() {
+                                                state.load_cabana_folder(&path);
+                                            } else {
+                                                state.load_file(&path);
+                                            }
                                         }
                                     } else {
                                         ui.text_disabled(&format!("{} (missing)", display));
@@ -1778,9 +1834,29 @@ fn main() {
                 }
 
                 // Export Dialog
-                if let Some(_export_request) = state.export_dialog.render(&ui) {
-                    // TODO: Implement actual export functionality
-                    info!("Export requested");
+                if let Some(export_request) = state.export_dialog.render(&ui) {
+                    if let Some(path) = FileDialogs::export_csv_file() {
+                        if let Ok(mut file) = std::fs::File::create(&path) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "time,addr,bus,data");
+                            let first_ts = state.messages.first().map(|m| m.timestamp);
+                            for msg in &state.messages {
+                                let rel_time = first_ts
+                                    .map(|t| (msg.timestamp - t).num_microseconds().unwrap_or(0) as f64 / 1_000_000.0)
+                                    .unwrap_or(0.0);
+                                let data_hex = if msg.data.is_empty() {
+                                    "0x".to_string()
+                                } else {
+                                    format!("0x{}", msg.data.iter().map(|b| format!("{:02X}", b)).collect::<String>())
+                                };
+                                let _ = writeln!(file, "{:.6},0x{:03X},{},{}", rel_time, msg.id, msg.bus, data_hex);
+                            }
+                            state.status_message = Some(format!("Exported {} messages to {}", state.messages.len(), path.display()));
+                            info!("Exported {} messages to {}", state.messages.len(), path.display());
+                        } else {
+                            state.status_message = Some("Failed to create export file".to_string());
+                        }
+                    }
                 }
 
                 // About Dialog

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 /// Supported file types for CAN data
 pub const CAN_FILE_FILTERS: &[(&str, &[&str])] = &[
+    ("CAN Logs (CSV, rlog)", &["csv", "rlog"]),
     ("CSV Files", &["csv"]),
+    ("Cabana/openpilot rlog", &["rlog"]),
     ("All Files", &["*"]),
 ];
 
@@ -27,10 +29,19 @@ impl FileDialogs {
     /// Open a file dialog for selecting a CAN log file
     pub fn open_can_file() -> Option<PathBuf> {
         FileDialog::new()
+            .add_filter("CAN Logs (CSV, rlog)", &["csv", "rlog"])
             .add_filter("CSV Files", &["csv"])
+            .add_filter("Cabana/openpilot rlog", &["rlog"])
             .add_filter("All Files", &["*"])
             .set_title("Open CAN Log File")
             .pick_file()
+    }
+
+    /// Open a folder dialog for selecting a Cabana session (folder with segment subfolders)
+    pub fn open_cabana_session_folder() -> Option<PathBuf> {
+        FileDialog::new()
+            .set_title("Open Cabana Session Folder")
+            .pick_folder()
     }
 
     /// Open a file dialog for selecting a DBC file

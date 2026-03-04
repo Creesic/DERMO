@@ -450,7 +450,7 @@ impl MultiSignalGraph {
             self.draw_grid(&draw_list, pos_min, pos_max, overall_min, overall_max);
         }
 
-        // Draw each visible series
+        // Draw each visible series (min-max per-pixel decimation: preserves full vertical range at every pixel column)
         for series in self.series.values() {
             if !series.visible {
                 continue;
@@ -462,24 +462,49 @@ impl MultiSignalGraph {
                 series.get_value_range_in_window(time_start, time_end)
             };
 
-            let window_points: Vec<_> = series.data_points.iter()
+            let window_points: Vec<(f64, DateTime<Utc>)> = series.data_points.iter()
                 .filter(|(_, ts)| *ts >= time_start && *ts <= time_end)
+                .cloned()
                 .collect();
 
             if window_points.len() < 2 {
                 continue;
             }
 
-            for i in 0..window_points.len() - 1 {
-                let (v1, t1) = window_points[i];
-                let (v2, t2) = window_points[i + 1];
+            // Min-max decimation: envelope shows oscillation range, trend shows smooth average
+            let (trend_points, envelope_lines) = self.downsample_minmax_to_screen(
+                &window_points,
+                time_start,
+                time_end,
+                min_val,
+                max_val,
+                pos_min,
+                pos_max,
+            );
 
-                let x1 = self.time_to_x(*t1, time_start, time_end, pos_min, pos_max);
-                let y1 = self.value_to_y(*v1, min_val, max_val, pos_min, pos_max);
-                let x2 = self.time_to_x(*t2, time_start, time_end, pos_min, pos_max);
-                let y2 = self.value_to_y(*v2, min_val, max_val, pos_min, pos_max);
+            // Draw min-max envelope as filled rects (behind the trend line).
+            // Each rect extends to the next occupied column, filling gaps of any size
+            // caused by non-uniform CAN bus message timing at resonant zoom levels.
+            if !envelope_lines.is_empty() {
+                let env_color = [series.color[0], series.color[1], series.color[2], series.color[3] * 0.35];
+                for i in 0..envelope_lines.len() {
+                    let (x, y_min, y_max) = envelope_lines[i];
+                    let top = y_min.min(y_max);
+                    let bottom = y_min.max(y_max);
+                    // Extend to the next envelope column to seal any gap
+                    let x_right = if i + 1 < envelope_lines.len() {
+                        envelope_lines[i + 1].0
+                    } else {
+                        x + 1.0
+                    };
+                    draw_list.add_rect([x - 0.5, top], [x_right + 0.5, bottom], env_color)
+                        .filled(true).build();
+                }
+            }
 
-                draw_list.add_line([x1, y1], [x2, y2], series.color)
+            // Draw smooth trend line on top
+            if trend_points.len() >= 2 {
+                draw_list.add_polyline(trend_points, series.color)
                     .thickness(2.0).build();
             }
         }
@@ -973,6 +998,112 @@ impl MultiSignalGraph {
         for name in to_remove {
             self.remove_signal(&name);
         }
+    }
+
+    /// Min-max per-pixel-column decimation with two-pass output.
+    /// Returns (trend_polyline, envelope_lines):
+    /// - trend: smooth polyline using per-column average values (clean line like an oscilloscope)
+    /// - envelope: vertical segments (x, y_min, y_max) showing the full oscillation range
+    ///
+    /// Rendering the envelope as individual vertical lines avoids the ImGui polyline anti-aliasing
+    /// issue where steep connecting segments between pixel columns appear ghostly/dotted.
+    fn downsample_minmax_to_screen(
+        &self,
+        points: &[(f64, DateTime<Utc>)],
+        time_start: DateTime<Utc>,
+        time_end: DateTime<Utc>,
+        min_val: f64,
+        max_val: f64,
+        pos_min: [f32; 2],
+        pos_max: [f32; 2],
+    ) -> (Vec<[f32; 2]>, Vec<(f32, f32, f32)>) {
+        let n = points.len();
+        if n == 0 {
+            return (vec![], vec![]);
+        }
+
+        let width = (pos_max[0] - pos_min[0]).ceil() as usize;
+        if width == 0 {
+            return (vec![], vec![]);
+        }
+
+        // Only skip decimation when data is truly sparse (<0.5 points per pixel).
+        // Above that density, oscillations within pixel columns cause polyline zigzag artifacts.
+        if n <= width / 2 {
+            let trend = points.iter()
+                .map(|(v, t)| {
+                    let x = self.time_to_x(*t, time_start, time_end, pos_min, pos_max);
+                    let y = self.value_to_y(*v, min_val, max_val, pos_min, pos_max);
+                    [x, y]
+                })
+                .collect();
+            return (trend, vec![]);
+        }
+
+        let total_duration_ms = (time_end - time_start).num_milliseconds() as f64;
+        if total_duration_ms <= 0.0 {
+            return (vec![], vec![]);
+        }
+
+        // Per-pixel-column bucket: tracks min/max/sum for envelope + average trend
+        struct Bucket {
+            min: f64,
+            max: f64,
+            sum: f64,
+            count: usize,
+        }
+
+        // Assign every data point to its pixel column bucket
+        let mut buckets: Vec<Option<Bucket>> = (0..width).map(|_| None).collect();
+
+        for (v, t) in points.iter() {
+            let elapsed_ms = (*t - time_start).num_milliseconds() as f64;
+            let frac = elapsed_ms / total_duration_ms;
+            let px = ((frac * width as f64).floor() as usize).min(width - 1);
+
+            match &mut buckets[px] {
+                None => {
+                    buckets[px] = Some(Bucket {
+                        min: *v,
+                        max: *v,
+                        sum: *v,
+                        count: 1,
+                    });
+                }
+                Some(b) => {
+                    if *v < b.min { b.min = *v; }
+                    if *v > b.max { b.max = *v; }
+                    b.sum += *v;
+                    b.count += 1;
+                }
+            }
+        }
+
+        // Build two outputs: smooth trend (averages) and envelope (min-max vertical lines)
+        let mut trend: Vec<[f32; 2]> = Vec::with_capacity(width);
+        let mut envelope: Vec<(f32, f32, f32)> = Vec::with_capacity(width);
+
+        for (px, bucket) in buckets.iter().enumerate() {
+            let Some(b) = bucket else { continue };
+
+            let x = pos_min[0] + px as f32 + 0.5; // center of pixel column
+
+            // Trend: per-column average for a smooth connected line
+            let avg = b.sum / b.count as f64;
+            let y_avg = self.value_to_y(avg, min_val, max_val, pos_min, pos_max);
+            trend.push([x, y_avg]);
+
+            // Envelope: min-max vertical line when there's meaningful oscillation
+            if b.count > 1 {
+                let y_min = self.value_to_y(b.min, min_val, max_val, pos_min, pos_max);
+                let y_max = self.value_to_y(b.max, min_val, max_val, pos_min, pos_max);
+                if (y_min - y_max).abs() > 1.0 {
+                    envelope.push((x, y_min, y_max));
+                }
+            }
+        }
+
+        (trend, envelope)
     }
 
     fn value_to_y(&self, value: f64, min: f64, max: f64, pos_min: [f32; 2], pos_max: [f32; 2]) -> f32 {

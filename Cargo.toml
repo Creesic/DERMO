@@ -42,6 +42,7 @@ md5 = "0.7"
 
 # utilities
 chrono = { version = "0.4", features = ["serde"] }
+bzip2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5.0"
