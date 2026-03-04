@@ -206,7 +206,7 @@ fn queue_isotp_send(
         let mut data = vec![0x0u8 | (payload.len() as u8)];
         data.extend_from_slice(payload);
         ctx.queue_send
-            .push((bus, CanMessage::new(bus, can_id, data)));
+            .push((bus, CanMessage::new(bus, can_id, data.into())));
         return;
     }
 
@@ -214,7 +214,7 @@ fn queue_isotp_send(
     let mut data = vec![0x10, (len >> 8) as u8, (len & 0xFF) as u8];
     data.extend_from_slice(&payload[..6.min(len)]);
     ctx.queue_send
-        .push((bus, CanMessage::new(bus, can_id, data)));
+        .push((bus, CanMessage::new(bus, can_id, data.into())));
 
     let mut seq = 1u8;
     let mut offset = 6;
@@ -223,7 +223,7 @@ fn queue_isotp_send(
         let mut frame = vec![0x20 | seq];
         frame.extend_from_slice(&payload[offset..offset + chunk_len]);
         ctx.queue_send
-            .push((bus, CanMessage::new(bus, can_id, frame)));
+            .push((bus, CanMessage::new(bus, can_id, frame.into())));
         offset += chunk_len;
         seq = (seq + 1) & 0x0F;
     }

@@ -309,7 +309,7 @@ mod tests {
         let mut decoder = decoder;
         decoder.set_dbc(dbc);
 
-        let msg = CanMessage::new(0, 0x123, vec![100u8]);
+        let msg = CanMessage::new(0, 0x123, crate::core::CanData::from_slice(&[100]));
         let signals = decoder.decode_message(&msg);
 
         assert_eq!(signals.len(), 1);

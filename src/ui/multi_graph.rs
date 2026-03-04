@@ -30,10 +30,12 @@ impl DataSeries {
     pub fn add_point(&mut self, value: f64, timestamp: DateTime<Utc>) {
         self.data_points.push((value, timestamp));
 
-        // Trim if we exceed max_points, but keep some buffer
-        if self.data_points.len() > self.max_points {
-            let trim_count = (self.data_points.len() - self.max_points).max(1);
-            self.data_points.drain(0..trim_count);
+        // Batch trim: only drain when 10% over max, trim back to 90% of max.
+        // This amortizes the O(n) memmove cost across many insertions.
+        let threshold = self.max_points + self.max_points / 10;
+        if self.data_points.len() > threshold {
+            let keep_from = self.data_points.len() - self.max_points;
+            self.data_points.drain(0..keep_from);
         }
     }
 
@@ -41,24 +43,46 @@ impl DataSeries {
         self.data_points.clear();
     }
 
+    /// Get min/max value in the time window. Uses binary search to slice — O(log n + k) instead of O(n).
+    /// Critical for performance with large logs: previously iterated all 200k+ points per call.
     pub fn get_value_range_in_window(&self, time_start: DateTime<Utc>, time_end: DateTime<Utc>) -> (f64, f64) {
-        let values: Vec<f64> = self.data_points.iter()
-            .filter(|(_, ts)| *ts >= time_start && *ts <= time_end)
-            .map(|(v, _)| *v)
-            .collect();
+        let start_idx = self.data_points.partition_point(|(_, ts)| *ts < time_start);
+        let end_idx = self.data_points.partition_point(|(_, ts)| *ts <= time_end);
+        let window = &self.data_points[start_idx..end_idx];
 
-        if values.is_empty() {
-            return (0.0, 1.0);
+        let (min, max) = window.iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), (v, _)| {
+                (min.min(*v), max.max(*v))
+            });
+
+        if min == f64::INFINITY {
+            (0.0, 1.0)
+        } else {
+            (min, max)
         }
-
-        values.iter()
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
-                (min.min(v), max.max(v))
-            })
     }
 
     pub fn current_value(&self) -> Option<f64> {
         self.data_points.last().map(|(v, _)| *v)
+    }
+
+    /// Get interpolated value at a specific time. Returns None if outside data range.
+    pub fn get_value_at_time(&self, t: DateTime<Utc>) -> Option<f64> {
+        let idx = self.data_points.partition_point(|(_, ts)| *ts < t);
+        if idx == 0 {
+            return self.data_points.first().map(|(v, _)| *v);
+        }
+        if idx >= self.data_points.len() {
+            return self.data_points.last().map(|(v, _)| *v);
+        }
+        let (v_prev, t_prev) = self.data_points[idx - 1];
+        let (v_next, t_next) = self.data_points[idx];
+        let dt = (t_next - t_prev).num_milliseconds() as f64;
+        if dt <= 0.0 {
+            return Some(v_next);
+        }
+        let frac = (t - t_prev).num_milliseconds() as f64 / dt;
+        Some(v_prev + frac * (v_next - v_prev))
     }
 }
 
@@ -344,19 +368,23 @@ impl MultiSignalGraph {
 
         ui.spacing();
 
-        // Zoom slider (full width)
-        let recording_duration_secs = self.series.values()
-            .flat_map(|s| s.data_points.iter().map(|(_, ts)| *ts))
-            .max()
-            .map(|last| {
-                self.series.values()
-                    .flat_map(|s| s.data_points.iter().map(|(_, ts)| *ts))
-                    .min()
-                    .map(|first| (last - first).num_seconds() as f32)
-                    .unwrap_or(60.0)
-            })
-            .unwrap_or(60.0)
-            .max(5.0); // Minimum 5 second recording
+        // Zoom slider (full width) — use first()/last() since data is time-sorted
+        let recording_duration_secs = {
+            let mut earliest = None::<DateTime<Utc>>;
+            let mut latest = None::<DateTime<Utc>>;
+            for s in self.series.values() {
+                if let Some((_, ts)) = s.data_points.first() {
+                    earliest = Some(earliest.map_or(*ts, |e: DateTime<Utc>| e.min(*ts)));
+                }
+                if let Some((_, ts)) = s.data_points.last() {
+                    latest = Some(latest.map_or(*ts, |l: DateTime<Utc>| l.max(*ts)));
+                }
+            }
+            match (earliest, latest) {
+                (Some(first), Some(last)) => (last - first).num_seconds() as f32,
+                _ => 60.0,
+            }
+        }.max(5.0); // Minimum 5 second recording
 
         let slider_width = ui.content_region_avail()[0];
         self.log_slider_widget_full_width(ui, "##time_window_slider", 1.0, recording_duration_secs, slider_width);
@@ -381,48 +409,56 @@ impl MultiSignalGraph {
         let pos_min = cursor_pos;
         let pos_max = [cursor_pos[0] + size[0], cursor_pos[1] + size[1]];
 
-        draw_list.add_rect(pos_min, pos_max, ui.style_color(StyleColor::FrameBg))
+        draw_list.add_rect(pos_min, pos_max, [0.0, 0.0, 0.0, 1.0])
             .filled(true).rounding(4.0).build();
 
         // Determine time window - show sliding window around current time
         let window_duration = Duration::seconds(self.time_window_secs as i64);
 
-        // Get the overall data range for boundary checking
-        let all_times: Vec<DateTime<Utc>> = self.series.values()
-            .flat_map(|s| s.data_points.iter().map(|(_, ts)| *ts))
-            .collect();
-
-        let (data_start, data_end) = if let (Some(&first), Some(&last)) = (all_times.iter().min(), all_times.iter().max()) {
-            (first, last)
-        } else {
-            ui.dummy(size);
-            ui.text("No data");
-            return;
+        // Get the overall data range for boundary checking — use first()/last() since data is time-sorted
+        let (data_start, data_end) = {
+            let mut earliest = None::<DateTime<Utc>>;
+            let mut latest = None::<DateTime<Utc>>;
+            for s in self.series.values() {
+                if let Some((_, ts)) = s.data_points.first() {
+                    earliest = Some(earliest.map_or(*ts, |e: DateTime<Utc>| e.min(*ts)));
+                }
+                if let Some((_, ts)) = s.data_points.last() {
+                    latest = Some(latest.map_or(*ts, |l: DateTime<Utc>| l.max(*ts)));
+                }
+            }
+            match (earliest, latest) {
+                (Some(first), Some(last)) => (first, last),
+                _ => {
+                    ui.dummy(size);
+                    ui.text("No data");
+                    return;
+                }
+            }
         };
 
-        // Debug logging
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/can-viz-chart-debug.txt") {
-            let _ = writeln!(f, "Chart render: data_start={}, data_end={}, current_time={:?}",
-                data_start.format("%H:%M:%S%.3f"),
-                data_end.format("%H:%M:%S%.3f"),
-                current_time.map(|t| t.format("%H:%M:%S%.3f").to_string())
-            );
-            let _ = writeln!(f, "  Total data points: {}", all_times.len());
-            if let Some(&first) = all_times.first() {
-                let _ = writeln!(f, "  First point: {}", first.format("%H:%M:%S%.3f"));
-            }
-            if let Some(&last) = all_times.last() {
-                let _ = writeln!(f, "  Last point: {}", last.format("%H:%M:%S%.3f"));
-            }
-        }
-
-        // Calculate display window centered on current_time (or start if no current time)
+        // Calculate display window centered on current_time (or start if no current time).
+        // Snap time_start to a stable bucket grid to prevent peaks "dancing" when the window
+        // slides during playback — without snapping, points near bucket boundaries flip between
+        // adjacent pixel columns frame-to-frame.
         let (time_start, time_end) = if let Some(ct) = current_time {
             let half_window = Duration::seconds((self.time_window_secs / 2.0) as i64);
             let start = (ct - half_window).max(data_start);  // Clamp to data start
             let end = start + window_duration;  // End is always window_duration from start
-            (start, end)
+
+            // Snap start to bucket grid: bucket_dt = window/width, align to reduce boundary flipping
+            let chart_width = (pos_max[0] - pos_min[0]).max(1.0) as f64;
+            let total_ms = (end - start).num_milliseconds() as f64;
+            let bucket_dt_ms = total_ms / chart_width;
+            if bucket_dt_ms > 0.01 {
+                let offset_ms = (start - data_start).num_milliseconds() as f64;
+                let snapped_offset_ms = (offset_ms / bucket_dt_ms).round() * bucket_dt_ms;
+                let start_snapped = data_start + Duration::milliseconds(snapped_offset_ms as i64);
+                let end_snapped = start_snapped + window_duration;
+                (start_snapped.max(data_start), end_snapped)
+            } else {
+                (start, end)
+            }
         } else {
             // No current time, show from the beginning
             let start = data_start;
@@ -456,31 +492,45 @@ impl MultiSignalGraph {
                 continue;
             }
 
-            let (min_val, max_val) = if self.shared_y_axis {
-                (overall_min, overall_max)
-            } else {
-                series.get_value_range_in_window(time_start, time_end)
-            };
-
-            let window_points: Vec<(f64, DateTime<Utc>)> = series.data_points.iter()
-                .filter(|(_, ts)| *ts >= time_start && *ts <= time_end)
-                .cloned()
-                .collect();
+            // Binary search for window boundaries — O(log n) instead of O(n) linear scan
+            let start_idx = series.data_points.partition_point(|(_, ts)| *ts < time_start);
+            let end_idx = series.data_points.partition_point(|(_, ts)| *ts <= time_end);
+            let window_points = &series.data_points[start_idx..end_idx];
 
             if window_points.len() < 2 {
                 continue;
             }
 
-            // Min-max decimation: envelope shows oscillation range, trend shows smooth average
-            let (trend_points, envelope_lines) = self.downsample_minmax_to_screen(
-                &window_points,
+            // Min-max decimation: envelope shows oscillation range, trend shows smooth average.
+            // Downsample computes min/max in same pass — avoids extra get_value_range iteration.
+            let (trend_points, envelope_lines, range_min, range_max) = self.downsample_minmax_to_screen(
+                window_points,
                 time_start,
                 time_end,
-                min_val,
-                max_val,
                 pos_min,
                 pos_max,
             );
+
+            let (min_val, max_val) = if self.shared_y_axis {
+                (overall_min, overall_max)
+            } else {
+                (range_min, range_max)
+            };
+
+            // Re-map trend/envelope y coords when shared axis (downsample used per-series range)
+            let (trend_points, envelope_lines) = if self.shared_y_axis {
+                let remap_y = |y: f32| self.value_to_y(
+                    self.y_to_value(y, range_min, range_max, pos_min, pos_max),
+                    overall_min, overall_max, pos_min, pos_max
+                );
+                let trend: Vec<_> = trend_points.iter().map(|[x, y]| [*x, remap_y(*y)]).collect();
+                let env: Vec<_> = envelope_lines.iter()
+                    .map(|(x, y0, y1)| (*x, remap_y(*y0), remap_y(*y1)))
+                    .collect();
+                (trend, env)
+            } else {
+                (trend_points, envelope_lines)
+            };
 
             // Draw min-max envelope as filled rects (behind the trend line).
             // One rect per pixel column: bright line = trend, transparent cloud = envelope.
@@ -534,10 +584,16 @@ impl MultiSignalGraph {
         let is_in_chart = mouse_pos[0] >= pos_min[0] && mouse_pos[0] <= pos_max[0] &&
                           mouse_pos[1] >= pos_min[1] && mouse_pos[1] <= pos_max[1];
 
-        // Draw preview dashed line when hovering over chart
+        // Draw preview dashed line and value labels when hovering over chart
         if is_in_chart {
             let preview_x = mouse_pos[0];
             let preview_color = [1.0, 1.0, 1.0, 0.4];  // White with low opacity
+
+            // Compute time at mouse x for value lookup
+            let rel_x = (mouse_pos[0] - pos_min[0]) / (pos_max[0] - pos_min[0]).max(0.001);
+            let rel_x = rel_x.clamp(0.0, 1.0);
+            let window_duration_ms = (time_end - time_start).num_milliseconds() as f64;
+            let mouse_time = time_start + Duration::milliseconds((rel_x as f64 * window_duration_ms) as i64);
 
             // Draw dashed line (simulate with short segments)
             let dash_size = 4.0;
@@ -550,23 +606,40 @@ impl MultiSignalGraph {
                 y = segment_end + gap_size;
             }
 
+            // Draw value at intersection for each visible signal (color-coordinated)
+            let label_offset = 6.0;
+            for series in self.series.values().filter(|s| s.visible) {
+                if let Some(value) = series.get_value_at_time(mouse_time) {
+                    let (min_val, max_val) = if self.shared_y_axis {
+                        (overall_min, overall_max)
+                    } else {
+                        series.get_value_range_in_window(time_start, time_end)
+                    };
+                    let y_pos = self.value_to_y(value, min_val, max_val, pos_min, pos_max);
+                    let label = format!("{:.1}", value);
+                    let text_w = label.len() as f32 * 7.0;
+                    // Place to the right of line; if that overflows, place to the left
+                    let text_x = if preview_x + label_offset + text_w < pos_max[0] - 5.0 {
+                        preview_x + label_offset
+                    } else {
+                        preview_x - label_offset - text_w
+                    };
+                    // Small dark background for readability
+                    draw_list.add_rect(
+                        [text_x - 2.0, y_pos - 6.0],
+                        [text_x + text_w + 2.0, y_pos + 8.0],
+                        [0.1, 0.1, 0.1, 0.9]
+                    ).filled(true).rounding(2.0).build();
+                    draw_list.add_text([text_x, y_pos - 6.0], series.color, label);
+                }
+            }
+
             // Handle click-to-seek - move yellow line to where the dotted line is
             if ui.is_mouse_clicked(imgui::MouseButton::Left) {
                 if let Some(ct) = current_time {
-                    let rel_x = (mouse_pos[0] - pos_min[0]) / (pos_max[0] - pos_min[0]);
-                    if rel_x >= 0.0 && rel_x <= 1.0 {
-                        // Calculate the time at the mouse position (dashed line)
-                        let window_duration_ms = (time_end - time_start).num_milliseconds() as f64;
-                        let offset_ms = (rel_x as f64 * window_duration_ms) as i64;
-                        let mouse_time = time_start + Duration::milliseconds(offset_ms);
-
-                        // Calculate relative offset from current time (yellow line) to mouse position
-                        // Positive = mouse is to the right (forward), Negative = mouse is to the left (backward)
-                        let seek_offset_secs = (mouse_time - ct).num_milliseconds() as f32 / 1000.0;
-
-                        // Use positive value for relative seek from current time
-                        self.seek_request = Some(seek_offset_secs);
-                    }
+                    // Calculate relative offset from current time (yellow line) to mouse position
+                    let seek_offset_secs = (mouse_time - ct).num_milliseconds() as f32 / 1000.0;
+                    self.seek_request = Some(seek_offset_secs);
                 }
             }
         }
@@ -647,7 +720,7 @@ impl MultiSignalGraph {
     }
 
     /// Draw Y-axis labels for each signal when not using shared Y axis
-    /// Labels are positioned horizontally at the top of the chart, each in its signal's color
+    /// Labels are positioned horizontally at the top of the chart: max on top, min below, each in its signal's color
     fn draw_signal_y_labels(&self, draw_list: &imgui::DrawListMut, pos_min: [f32; 2], pos_max: [f32; 2],
                               time_start: DateTime<Utc>, time_end: DateTime<Utc>) {
         // Collect series data first to avoid borrow issues
@@ -665,39 +738,39 @@ impl MultiSignalGraph {
 
         // Position labels horizontally at the top of the chart
         let start_x = pos_min[0] + 5.0;
-        let y_pos = pos_min[1] + 4.0;  // Near the top
-        let label_spacing = 2.0;  // Small gap between labels
-        let text_height = 14.0;  // Approximate text height
+        let y_max = pos_min[1] + 4.0;   // Max values row
+        let y_min = y_max + 14.0;       // Min values row, below max
+        let label_spacing = 2.0;         // Small gap between labels
+        let text_height = 14.0;         // Approximate text height per row
 
-        // First pass: calculate total width needed
+        // First pass: calculate total width needed (max of max/min label widths per signal)
         let mut total_width = 0.0;
-        for (name, _color, _min_val, max_val) in &series_data {
-            let label = format!("{:.1}", max_val);
-            let text_width = label.len() as f32 * 7.0;
-            total_width += text_width + label_spacing;
+        for (_name, _color, min_val, max_val) in &series_data {
+            let max_label = format!("{:.1}", max_val);
+            let min_label = format!("{:.1}", min_val);
+            let width = (max_label.len().max(min_label.len()) as f32 * 7.0) + label_spacing;
+            total_width += width;
         }
 
-        // Draw semi-transparent gray background behind all labels
+        // Draw semi-transparent gray background behind all labels (covers both rows)
         let bg_color = [0.1, 0.1, 0.1, 0.9];  // Dark gray with 90% opacity
         let bg_padding = 3.0;
         draw_list.add_rect(
-            [start_x - bg_padding, y_pos - bg_padding],
-            [start_x + total_width + bg_padding, y_pos + text_height + bg_padding],
+            [start_x - bg_padding, y_max - bg_padding],
+            [start_x + total_width + bg_padding, y_min + text_height + bg_padding],
             bg_color
         ).filled(true).rounding(3.0).build();
 
-        // Second pass: draw the labels
+        // Draw max labels on top row, min labels on bottom row
         let mut x_pos = start_x;
-        for (name, color, _min_val, max_val) in &series_data {
-            let label = format!("{:.1}", max_val);
+        for (_name, color, min_val, max_val) in &series_data {
+            let max_label = format!("{:.1}", max_val);
+            let min_label = format!("{:.1}", min_val);
+            let text_width = max_label.len().max(min_label.len()) as f32 * 7.0;
 
-            // Estimate text width (approximately 7 pixels per character)
-            let text_width = label.len() as f32 * 7.0;
+            draw_list.add_text([x_pos, y_max], *color, max_label);
+            draw_list.add_text([x_pos, y_min], *color, min_label);
 
-            // Draw the label at current x position
-            draw_list.add_text([x_pos, y_pos], *color, label);
-
-            // Move x position for next label (text width + spacing)
             x_pos += text_width + label_spacing;
         }
     }
@@ -995,49 +1068,64 @@ impl MultiSignalGraph {
         }
     }
 
+    /// Max decimation columns — caps GPU draw calls when zoomed out.
+    /// Chart width can exceed 1000px; capping reduces rects/polylines per series.
+    const MAX_DECIMATION_COLUMNS: usize = 384;
+
+    /// Points-per-pixel threshold above which we skip the envelope (LOD).
+    /// When zoomed way out, envelope is often a solid block; trend line alone is sufficient.
+    const ENVELOPE_SKIP_POINTS_PER_PIXEL: f64 = 12.0;
+
     /// Min-max per-pixel-column decimation with two-pass output.
-    /// Returns (trend_polyline, envelope_lines):
-    /// - trend: smooth polyline using per-column average values (clean line like an oscilloscope)
-    /// - envelope: vertical segments (x, y_min, y_max) showing the full oscillation range
-    ///
-    /// Rendering the envelope as individual vertical lines avoids the ImGui polyline anti-aliasing
-    /// issue where steep connecting segments between pixel columns appear ghostly/dotted.
+    /// Returns (trend_polyline, envelope_lines, range_min, range_max).
+    /// Computes min/max in the same pass as bucketing — avoids extra iteration.
     fn downsample_minmax_to_screen(
         &self,
         points: &[(f64, DateTime<Utc>)],
         time_start: DateTime<Utc>,
         time_end: DateTime<Utc>,
-        min_val: f64,
-        max_val: f64,
         pos_min: [f32; 2],
         pos_max: [f32; 2],
-    ) -> (Vec<[f32; 2]>, Vec<(f32, f32, f32)>) {
+    ) -> (Vec<[f32; 2]>, Vec<(f32, f32, f32)>, f64, f64) {
         let n = points.len();
         if n == 0 {
-            return (vec![], vec![]);
+            return (vec![], vec![], 0.0, 1.0);
         }
 
-        let width = (pos_max[0] - pos_min[0]).ceil() as usize;
-        if width == 0 {
-            return (vec![], vec![]);
+        let raw_width = (pos_max[0] - pos_min[0]).ceil() as usize;
+        if raw_width == 0 {
+            return (vec![], vec![], 0.0, 1.0);
         }
 
-        // Only skip decimation when data is truly sparse (<0.5 points per pixel).
-        // Above that density, oscillations within pixel columns cause polyline zigzag artifacts.
+        // Cap decimation columns to reduce GPU load (rects + polyline vertices).
+        let width = raw_width.min(Self::MAX_DECIMATION_COLUMNS);
+        let points_per_pixel = n as f64 / width as f64;
+
+        // Sparse case: no decimation, compute min/max in same pass
         if n <= width / 2 {
+            let (min_val, max_val) = points.iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), (v, _)| {
+                    (min.min(*v), max.max(*v))
+                });
+            let (min_val, max_val) = if min_val == f64::INFINITY {
+                (0.0, 1.0)
+            } else {
+                (min_val, max_val)
+            };
+            let round_to_pixel = |v: f32| (v * 2.0).round() / 2.0;
             let trend = points.iter()
                 .map(|(v, t)| {
-                    let x = self.time_to_x(*t, time_start, time_end, pos_min, pos_max);
-                    let y = self.value_to_y(*v, min_val, max_val, pos_min, pos_max);
+                    let x = round_to_pixel(self.time_to_x(*t, time_start, time_end, pos_min, pos_max));
+                    let y = round_to_pixel(self.value_to_y(*v, min_val, max_val, pos_min, pos_max));
                     [x, y]
                 })
                 .collect();
-            return (trend, vec![]);
+            return (trend, vec![], min_val, max_val);
         }
 
         let total_duration_ms = (time_end - time_start).num_milliseconds() as f64;
         if total_duration_ms <= 0.0 {
-            return (vec![], vec![]);
+            return (vec![], vec![], 0.0, 1.0);
         }
 
         // Per-pixel-column bucket: tracks min/max/sum for envelope + average trend
@@ -1074,20 +1162,34 @@ impl MultiSignalGraph {
             }
         }
 
-        // Build two outputs: smooth trend (averages) and envelope (min-max vertical lines)
-        // Use full width so trend has no gaps; interpolate empty buckets from neighbors
+        // Derive overall min/max from buckets (no extra iteration over points)
+        let (min_val, max_val) = buckets.iter()
+            .filter_map(|b| b.as_ref())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), b| {
+                (min.min(b.min), max.max(b.max))
+            });
+        let (min_val, max_val) = if min_val == f64::INFINITY {
+            (0.0, 1.0)
+        } else {
+            (min_val, max_val)
+        };
+
+        let round_to_pixel = |v: f32| (v * 2.0).round() / 2.0;
+
         let mut trend: Vec<[f32; 2]> = Vec::with_capacity(width);
         let mut envelope: Vec<(f32, f32, f32)> = Vec::with_capacity(width);
 
+        let chart_width = pos_max[0] - pos_min[0];
+        let col_width = chart_width / width as f32;
         let mut last_avg = None::<f64>;
         for (px, bucket) in buckets.iter().enumerate() {
-            let x = pos_min[0] + px as f32 + 0.5; // center of pixel column
+            let x = round_to_pixel(pos_min[0] + (px as f32 + 0.5) * col_width); // center of bucket column
 
             let (avg, env_opt) = if let Some(b) = bucket {
                 let avg = b.sum / b.count as f64;
                 last_avg = Some(avg);
-                let y_min = self.value_to_y(b.min, min_val, max_val, pos_min, pos_max);
-                let y_max = self.value_to_y(b.max, min_val, max_val, pos_min, pos_max);
+                let y_min = round_to_pixel(self.value_to_y(b.min, min_val, max_val, pos_min, pos_max));
+                let y_max = round_to_pixel(self.value_to_y(b.max, min_val, max_val, pos_min, pos_max));
                 let env_opt = if b.count > 1 && (y_min - y_max).abs() > 0.5 {
                     Some((y_min, y_max))
                 } else {
@@ -1100,15 +1202,18 @@ impl MultiSignalGraph {
                 (avg, None)
             };
 
-            let y_avg = self.value_to_y(avg, min_val, max_val, pos_min, pos_max);
+            let y_avg = round_to_pixel(self.value_to_y(avg, min_val, max_val, pos_min, pos_max));
             trend.push([x, y_avg]);
 
-            if let Some((y_min, y_max)) = env_opt {
-                envelope.push((x, y_min, y_max));
+            // LOD: skip envelope when zoomed out — it becomes a solid block, trend line is enough
+            if points_per_pixel <= Self::ENVELOPE_SKIP_POINTS_PER_PIXEL {
+                if let Some((y_min, y_max)) = env_opt {
+                    envelope.push((x, y_min, y_max));
+                }
             }
         }
 
-        (trend, envelope)
+        (trend, envelope, min_val, max_val)
     }
 
     fn value_to_y(&self, value: f64, min: f64, max: f64, pos_min: [f32; 2], pos_max: [f32; 2]) -> f32 {
@@ -1119,6 +1224,19 @@ impl MultiSignalGraph {
         let normalized = (value - min) / range;
         let clamped = normalized.clamp(0.0, 1.0);
         pos_max[1] - (clamped as f32) * (pos_max[1] - pos_min[1])
+    }
+
+    fn y_to_value(&self, y: f32, min: f64, max: f64, pos_min: [f32; 2], pos_max: [f32; 2]) -> f64 {
+        let range = max - min;
+        if range == 0.0 {
+            return min;
+        }
+        let chart_h = pos_max[1] - pos_min[1];
+        if chart_h <= 0.0 {
+            return min;
+        }
+        let normalized = (pos_max[1] - y) / chart_h;
+        min + (normalized as f64).clamp(0.0, 1.0) * range
     }
 
     fn time_to_x(&self, time: DateTime<Utc>, time_start: DateTime<Utc>, time_end: DateTime<Utc>, pos_min: [f32; 2], pos_max: [f32; 2]) -> f32 {

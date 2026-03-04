@@ -72,7 +72,7 @@ impl MessageState {
 
         // Update data and calculate colors
         let old_data = self.data.clone();
-        self.data = msg.data.clone();
+        self.data = msg.data.to_vec();
         self.byte_colors = self.calculate_byte_colors(&old_data, &msg.data);
 
         self.count += 1;

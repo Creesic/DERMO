@@ -1525,7 +1525,7 @@ fn main() {
                         }
                         LiveModeAction::SendMessage { id, data } => {
                             info!("Send message: 0x{:03X} {:?}", id, data);
-                            let msg = CanMessage::new(0, id, data);
+                            let msg = CanMessage::new(0, id, data.into());
                             // Send to bus 0 by default (could add UI to select bus)
                             let _ = rt.block_on(state.can_collection.send_to_bus(0, msg));
                         }
@@ -1546,7 +1546,7 @@ fn main() {
                                         timestamp: lm.timestamp,
                                         bus: lm.bus,
                                         id: lm.id,
-                                        data: lm.data.clone(),
+                                        data: lm.data.clone().into(),
                                     })
                                     .collect();
 
@@ -1639,7 +1639,7 @@ fn main() {
                     for msg in &live_messages {
                         // Only store messages if recording is active
                         if is_recording {
-                            live_state.add_message(msg.message.id, msg.message.data.clone(), msg.message.bus);
+                            live_state.add_message(msg.message.id, msg.message.data.to_vec(), msg.message.bus);
                         }
 
                         // Always update statistics
@@ -1721,7 +1721,7 @@ fn main() {
                                 timestamp: lm.timestamp,
                                 bus: lm.bus,
                                 id: lm.id,
-                                data: lm.data.clone(),
+                                data: lm.data.clone().into(),
                             },
                             timestamp: lm.timestamp,
                         });

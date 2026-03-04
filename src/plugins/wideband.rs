@@ -420,7 +420,7 @@ impl RusefiWidebandPlugin {
         if let Some(gain) = self.pump_gain_x100 {
             data.push(gain);
         }
-        CanMessage::new(self.tx_bus, WB_CMD_ECU_STATUS, data)
+        CanMessage::new(self.tx_bus, WB_CMD_ECU_STATUS, data.into())
     }
 
     /// Ping (0xEF60000): payload = base CAN ID as [high, low] (e.g. 190 → 01 90)
@@ -429,7 +429,7 @@ impl RusefiWidebandPlugin {
             ((self.rusefi_base_id >> 8) & 0xFF) as u8,
             (self.rusefi_base_id & 0xFF) as u8,
         ];
-        let msg = CanMessage::new(self.tx_bus, WB_CMD_PING, data);
+        let msg = CanMessage::new(self.tx_bus, WB_CMD_PING, data.into());
         for _ in 0..100 {
             ctx.queue_send.push((self.tx_bus, msg.clone()));
         }
@@ -444,7 +444,7 @@ impl RusefiWidebandPlugin {
         } else {
             vec![((base >> 8) & 0xFF) as u8, (base & 0xFF) as u8]
         };
-        let msg = CanMessage::new(self.tx_bus, WB_CMD_SET_INDEX, data);
+        let msg = CanMessage::new(self.tx_bus, WB_CMD_SET_INDEX, data.into());
         for _ in 0..100 {
             ctx.queue_send.push((self.tx_bus, msg.clone()));
         }
@@ -454,7 +454,7 @@ impl RusefiWidebandPlugin {
         let data = vec![self.hw_index, self.sensor_type];
         ctx.queue_send.push((
             self.tx_bus,
-            CanMessage::new(self.tx_bus, WB_CMD_SET_SENSOR_TYPE, data),
+            CanMessage::new(self.tx_bus, WB_CMD_SET_SENSOR_TYPE, data.into()),
         ));
     }
 }

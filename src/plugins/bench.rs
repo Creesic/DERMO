@@ -334,7 +334,7 @@ impl RusefiBenchPlugin {
             0,
             0,
         ];
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 2, data)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 2, data.into())));
     }
 
     fn queue_user_control(&self, ctx: &mut crate::plugins::PluginContext) {
@@ -348,7 +348,7 @@ impl RusefiBenchPlugin {
             0,
             0,
         ];
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 0x0C, data)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 0x0C, data.into())));
     }
 
     fn queue_req_calibration(&self, ctx: &mut crate::plugins::PluginContext) {
@@ -363,7 +363,7 @@ impl RusefiBenchPlugin {
             0,
             0,
         ];
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 0x12, data)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, BENCH_BASE + 0x12, data.into())));
     }
 }
 

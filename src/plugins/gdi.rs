@@ -322,30 +322,30 @@ impl RusefiGdiPlugin {
         set_u16_le(&mut p0, 1, self.edit_config1.boost_voltage);
         set_u16_le(&mut p0, 3, float_to_short128(self.edit_config1.boost_current));
         set_u16_le(&mut p0, 5, self.edit_config1.t_boost_min);
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id, p0)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id, p0.into())));
 
         let mut p1 = vec![GDI4_CAN_SET_TAG; GDI4_CAN_SET_DLC];
         set_u16_le(&mut p1, 1, self.edit_config1.t_boost_max);
         set_u16_le(&mut p1, 3, float_to_short128(self.edit_config2.peak_current));
         set_u16_le(&mut p1, 5, self.edit_config2.t_peak_duration);
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 1, p1)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 1, p1.into())));
 
         let mut p2 = vec![GDI4_CAN_SET_TAG; GDI4_CAN_SET_DLC];
         set_u16_le(&mut p2, 1, self.edit_config2.t_peak_off);
         set_u16_le(&mut p2, 3, self.edit_config2.t_bypass);
         set_u16_le(&mut p2, 5, float_to_short128(self.edit_config3.hold_current));
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 2, p2)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 2, p2.into())));
 
         let mut p3 = vec![GDI4_CAN_SET_TAG; GDI4_CAN_SET_DLC];
         set_u16_le(&mut p3, 1, self.edit_config3.t_hold_off);
         set_u16_le(&mut p3, 3, self.edit_config3.t_hold_duration);
         set_u16_le(&mut p3, 5, float_to_short128(self.edit_config3.pump_peak_current));
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 3, p3)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 3, p3.into())));
 
         let mut p4 = vec![GDI4_CAN_SET_TAG; GDI4_CAN_SET_DLC];
         set_u16_le(&mut p4, 1, float_to_short128(self.edit_config4.pump_hold_current));
         set_u16_le(&mut p4, 3, self.edit_output_can_id);
-        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 4, p4)));
+        ctx.queue_send.push((self.tx_bus, CanMessage::new(self.tx_bus, input_id + 4, p4.into())));
 
         info!("GDI: Sent config to 0x{:03X}", input_id);
     }

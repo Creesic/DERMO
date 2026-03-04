@@ -419,7 +419,7 @@ fn decode_can_list(
                 timestamp,
                 bus: src,
                 id: address,
-                data: dat,
+                data: dat.into(),
             });
         }
     }

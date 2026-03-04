@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use crate::core::CanMessage;
+use crate::core::{CanData, CanMessage};
 use chrono::Utc;
 
 /// Column layout for CSV parsing
@@ -83,7 +83,7 @@ pub fn load_csv_streaming(
                         }
                     }
                 }
-                (time_val, bus, id, data)
+                (time_val, bus, id, CanData::from_slice(&data))
             }
         };
 
@@ -139,7 +139,8 @@ pub fn load_csv_with_progress(
     let headers = rdr.headers()?;
     let layout = detect_columns(headers)?;
 
-    let mut messages = Vec::new();
+    // Pre-allocate based on file size (~50 bytes per CSV record on average)
+    let mut messages = Vec::with_capacity(total_bytes / 50);
     let mut accumulated_time_secs = 0.0;
     let mut last_seen_time = 0.0;
     let time_is_microseconds = matches!(&layout, CsvLayout::DriveSav { .. });
@@ -182,7 +183,7 @@ pub fn load_csv_with_progress(
                         }
                     }
                 }
-                (time_val, bus, id, data)
+                (time_val, bus, id, CanData::from_slice(&data))
             }
         };
 
@@ -219,6 +220,7 @@ pub fn load_csv_with_progress(
 /// Timestamps are treated as relative seconds (or microseconds for driveSAV) from the start of the log
 pub fn load_csv(path: &str) -> Result<Vec<CanMessage>> {
     let file_path = Path::new(path);
+    let total_bytes = std::fs::metadata(file_path).map(|m| m.len() as usize).unwrap_or(0);
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .from_path(file_path)?;
@@ -226,7 +228,8 @@ pub fn load_csv(path: &str) -> Result<Vec<CanMessage>> {
     let headers = rdr.headers()?;
     let layout = detect_columns(headers)?;
 
-    let mut messages = Vec::new();
+    // Pre-allocate based on file size (~50 bytes per CSV record on average)
+    let mut messages = Vec::with_capacity(total_bytes / 50);
 
     // Use the first message's actual time as base, and accumulate for subsequent messages
     let mut accumulated_time_secs = 0.0;
@@ -263,7 +266,7 @@ pub fn load_csv(path: &str) -> Result<Vec<CanMessage>> {
                         }
                     }
                 }
-                (time_val, bus, id, data)
+                (time_val, bus, id, CanData::from_slice(&data))
             }
         };
 

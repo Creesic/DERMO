@@ -159,7 +159,7 @@ impl SerialCanInterface {
         let hex_data = &data[4..expected_len];
         let msg_data = Self::parse_hex_data(hex_data)?;
 
-        Some(CanMessage::new(bus_id, id, msg_data))
+        Some(CanMessage::new(bus_id, id, msg_data.into()))
     }
 
     /// Parse an extended (29-bit ID) CAN frame
@@ -180,7 +180,7 @@ impl SerialCanInterface {
         let hex_data = &data[9..expected_len];
         let msg_data = Self::parse_hex_data(hex_data)?;
 
-        Some(CanMessage::new(bus_id, id, msg_data))
+        Some(CanMessage::new(bus_id, id, msg_data.into()))
     }
 
     /// Parse hex data string into bytes

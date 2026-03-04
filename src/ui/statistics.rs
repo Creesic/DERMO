@@ -73,7 +73,7 @@ impl MessageStatistics {
             }
 
             if stats.data_samples.len() < 10 {
-                stats.data_samples.push(msg.data.clone());
+                stats.data_samples.push(msg.data.to_vec());
             }
         }
 

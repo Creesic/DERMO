@@ -87,7 +87,7 @@ impl MockCanInterface {
             0xEF,
         ];
 
-        CanMessage::new(self.bus_id, id, data)
+        CanMessage::new(self.bus_id, id, data.into())
     }
 }
 
@@ -183,7 +183,7 @@ mod tests {
         iface.connect(CanConfig::default()).await.unwrap();
 
         // Inject a message
-        let msg = CanMessage::new(0, 0x123, vec![1, 2, 3, 4]);
+        let msg = CanMessage::new(0, 0x123, crate::core::CanData::from_slice(&[1, 2, 3, 4]));
         iface.inject_message(msg.clone());
 
         // Receive the message
