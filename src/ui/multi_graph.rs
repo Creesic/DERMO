@@ -483,23 +483,18 @@ impl MultiSignalGraph {
             );
 
             // Draw min-max envelope as filled rects (behind the trend line).
-            // Each rect extends to the next occupied column, filling gaps of any size
-            // caused by non-uniform CAN bus message timing at resonant zoom levels.
+            // One rect per pixel column: bright line = trend, transparent cloud = envelope.
             if !envelope_lines.is_empty() {
-                let env_color = [series.color[0], series.color[1], series.color[2], series.color[3] * 0.35];
-                for i in 0..envelope_lines.len() {
-                    let (x, y_min, y_max) = envelope_lines[i];
-                    let top = y_min.min(y_max);
-                    let bottom = y_min.max(y_max);
-                    // Extend to the next envelope column to seal any gap
-                    let x_right = if i + 1 < envelope_lines.len() {
-                        envelope_lines[i + 1].0
-                    } else {
-                        x + 1.0
-                    };
-                    draw_list.add_rect([x - 0.5, top], [x_right + 0.5, bottom], env_color)
-                        .filled(true).build();
-                }
+                let env_color = [series.color[0], series.color[1], series.color[2], series.color[3] * 0.4];
+                draw_list.with_clip_rect(pos_min, pos_max, || {
+                    for (x, y_min, y_max) in &envelope_lines {
+                        let top = y_min.min(*y_max);
+                        let bottom = y_min.max(*y_max);
+                        // One pixel wide per column so cloud aligns with trend
+                        draw_list.add_rect([*x - 0.5, top], [*x + 0.5, bottom], env_color)
+                            .filled(true).build();
+                    }
+                });
             }
 
             // Draw smooth trend line on top
@@ -1080,26 +1075,36 @@ impl MultiSignalGraph {
         }
 
         // Build two outputs: smooth trend (averages) and envelope (min-max vertical lines)
+        // Use full width so trend has no gaps; interpolate empty buckets from neighbors
         let mut trend: Vec<[f32; 2]> = Vec::with_capacity(width);
         let mut envelope: Vec<(f32, f32, f32)> = Vec::with_capacity(width);
 
+        let mut last_avg = None::<f64>;
         for (px, bucket) in buckets.iter().enumerate() {
-            let Some(b) = bucket else { continue };
-
             let x = pos_min[0] + px as f32 + 0.5; // center of pixel column
 
-            // Trend: per-column average for a smooth connected line
-            let avg = b.sum / b.count as f64;
+            let (avg, env_opt) = if let Some(b) = bucket {
+                let avg = b.sum / b.count as f64;
+                last_avg = Some(avg);
+                let y_min = self.value_to_y(b.min, min_val, max_val, pos_min, pos_max);
+                let y_max = self.value_to_y(b.max, min_val, max_val, pos_min, pos_max);
+                let env_opt = if b.count > 1 && (y_min - y_max).abs() > 0.5 {
+                    Some((y_min, y_max))
+                } else {
+                    None
+                };
+                (avg, env_opt)
+            } else {
+                // Empty bucket: extend last known value for continuous trend line
+                let avg = last_avg.unwrap_or(0.0);
+                (avg, None)
+            };
+
             let y_avg = self.value_to_y(avg, min_val, max_val, pos_min, pos_max);
             trend.push([x, y_avg]);
 
-            // Envelope: min-max vertical line when there's meaningful oscillation
-            if b.count > 1 {
-                let y_min = self.value_to_y(b.min, min_val, max_val, pos_min, pos_max);
-                let y_max = self.value_to_y(b.max, min_val, max_val, pos_min, pos_max);
-                if (y_min - y_max).abs() > 1.0 {
-                    envelope.push((x, y_min, y_max));
-                }
+            if let Some((y_min, y_max)) = env_opt {
+                envelope.push((x, y_min, y_max));
             }
         }
 

@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "shit"
-version = "0.1.51"
+version = "0.1.53"
 dependencies = [
  "anyhow",
  "async-trait",

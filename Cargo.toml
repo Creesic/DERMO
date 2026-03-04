@@ -1,6 +1,6 @@
 [package]
 name = "shit"
-version = "0.1.51"
+version = "0.1.53"
 edition = "2021"
 description = "Signal Harvesting & Interpretation Toolkit"
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
