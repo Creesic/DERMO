@@ -1,0 +1,1522 @@
+diff --git a/Host/Source/LibOpenBLT/CMakeLists.txt b/Host/Source/LibOpenBLT/CMakeLists.txt
+index abe58f1..2ec566b 100644
+--- a/Host/Source/LibOpenBLT/CMakeLists.txt
++++ b/Host/Source/LibOpenBLT/CMakeLists.txt
+@@ -63,6 +63,8 @@ option(LINT_ENABLED "Configurable to enable/disable the PC-lint target" OFF)
+ # Set the port directory, which is platform specific
+ if(WIN32)
+   set(PROJECT_PORT_DIR ${PROJECT_SOURCE_DIR}/port/windows)
++elseif(APPLE)
++  set(PROJECT_PORT_DIR ${PROJECT_SOURCE_DIR}/port/darwin)
+ elseif(UNIX)
+   set(PROJECT_PORT_DIR ${PROJECT_SOURCE_DIR}/port/linux)
+ endif(WIN32)
+@@ -100,6 +102,8 @@ if(WIN32)
+       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPLATFORM_WINDOWS -DPLATFORM_64BIT -D_CRT_SECURE_NO_WARNINGS")
+     endif()
+   endif()
++elseif(APPLE)
++  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPLATFORM_DARWIN -DPLATFORM_64BIT -pthread -std=gnu99")
+ elseif(UNIX)
+   if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPLATFORM_LINUX -DPLATFORM_32BIT -D_TIME_BITS=64 -D_FILE_OFFSET_BITS=64 -pthread -std=gnu99")
+@@ -133,7 +137,11 @@ endmacro()
+ 
+ # Set include directories
+ header_directories(PROJECT_PORT_INC_DIRS "${PROJECT_PORT_DIR}")
+-include_directories("${PROJECT_SOURCE_DIR}" "${PROJECT_PORT_INC_DIRS}")
++if(PROJECT_PORT_INC_DIRS)
++  include_directories("${PROJECT_SOURCE_DIR}" "${PROJECT_PORT_INC_DIRS}")
++else()
++  include_directories("${PROJECT_SOURCE_DIR}")
++endif()
+ 
+ 
+ #***************************************************************************************
+@@ -192,7 +200,19 @@ if(BUILD_SHARED)
+     # to build LibOpenBLT. Example under Debian/Ubuntu:
+     #   sudo apt-get install libusb-1.0-0 libusb-1.0-0-dev
+     # Additionally, the LibDL is needed for dynamic library loading.
+-    target_link_libraries(openblt_shared usb-1.0 dl)
++    if(APPLE)
++      # Prefer Homebrew libusb to avoid broken /usr/local/lib installs with wrong install_name
++      find_library(LIBUSB_LIB NAMES usb-1.0 libusb-1.0
++        PATHS /opt/homebrew/opt/libusb/lib /usr/local/opt/libusb/lib
++        NO_DEFAULT_PATH)
++      if(LIBUSB_LIB)
++        target_link_libraries(openblt_shared ${LIBUSB_LIB} dl)
++      else()
++        target_link_libraries(openblt_shared usb-1.0 dl)
++      endif()
++    else()
++      target_link_libraries(openblt_shared usb-1.0 dl "-Wl,-rpath,.")
++    endif()
+   elseif(WIN32)
+     # Link the Winsock library
+     target_link_libraries(openblt_shared ws2_32 winusb setupapi)
+diff --git a/Host/Source/LibOpenBLT/candriver.c b/Host/Source/LibOpenBLT/candriver.c
+index 25e19e2..6397af2 100644
+--- a/Host/Source/LibOpenBLT/candriver.c
++++ b/Host/Source/LibOpenBLT/candriver.c
+@@ -37,6 +37,19 @@
+ #include "candriver.h"                      /* Generic CAN driver module               */
+ #if defined(PLATFORM_LINUX)
+ #include "socketcan.h"                      /* SocketCAN interface                     */
++#elif defined(PLATFORM_DARWIN)
++/* macOS: no SocketCAN. Stub CAN interface - xcp_rs232, xcp_usb, xcp_net work. */
++static void CanStubInit(tCanSettings const * settings) { (void)settings; }
++static void CanStubTerminate(void) { }
++static bool CanStubConnect(void) { return false; }
++static void CanStubDisconnect(void) { }
++static bool CanStubTransmit(tCanMsg const * msg) { (void)msg; return false; }
++static bool CanStubIsBusError(void) { return false; }
++static void CanStubRegisterEvents(tCanEvents const * events) { (void)events; }
++static tCanInterface const canStubInterface = {
++  CanStubInit, CanStubTerminate, CanStubConnect, CanStubDisconnect,
++  CanStubTransmit, CanStubIsBusError, CanStubRegisterEvents
++};
+ #else
+ #include "pcanusb.h"                        /* Peak PCAN-USB interface                 */
+ #include "kvcanlib.h"                       /* Kvaser CANLIB SDK API                   */
+@@ -87,6 +100,9 @@ void CanInit(tCanSettings const * settings)
+        * the SocketCAN interface to the CAN driver.
+        */
+       canIfPtr = SocketCanGetInterface();
++#elif defined(PLATFORM_DARWIN)
++      /* macOS: CAN not supported (no SocketCAN). Use stub - Connect() will fail. */
++      canIfPtr = &canStubInterface;
+ #else
+       if (strcmp(settings->devicename, "peak_pcanusb") == 0)
+       {
+diff --git a/Host/Source/LibOpenBLT/port/darwin/critutil.c b/Host/Source/LibOpenBLT/port/darwin/critutil.c
+new file mode 100644
+index 0000000..a7959df
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/critutil.c
+@@ -0,0 +1,126 @@
++/************************************************************************************//**
++* \file         port/darwin/critutil.c
++* \brief        Critical section utility source file.
++* \ingroup      Utility
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It 
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++* 
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <assert.h>                         /* for assertions                          */
++#include <stdint.h>                         /* for standard integer types              */
++#include <stdbool.h>                        /* for boolean type                        */
++#include <pthread.h>                        /* for posix threads                       */
++#include "util.h"                           /* Utility module                          */
++
++
++/****************************************************************************************
++* Local data declarations
++****************************************************************************************/
++/** \brief Flag to determine if the critical section object was already initialized. */
++static volatile bool criticalSectionInitialized = false;
++
++/** \brief Critical section object. */
++static volatile pthread_mutex_t mtxCritSect;
++
++
++/************************************************************************************//**
++** \brief     Initializes the critical section module. Should be called before the
++**            Enter/Exit functions are used. It is okay to call this initialization
++**            multiple times from different modules.
++**
++****************************************************************************************/
++void UtilCriticalSectionInit(void)
++{
++  /* Only initialize if not yet done so previously. */
++  if (!criticalSectionInitialized)
++  {
++    /* Initialize the critical section object. */
++    (void)pthread_mutex_init((pthread_mutex_t *)&mtxCritSect, NULL);
++    /* Set initialized flag. */
++    criticalSectionInitialized = true;
++  }
++} /*** end of UtilCriticalSectionInit ***/
++
++
++/************************************************************************************//**
++** \brief     Terminates the critical section module. Should be called once critical
++**            sections are no longer needed. Typically called from another module's
++**            termination function that also initialized it. It is okay to call this 
++**            termination multiple times from different modules.
++**
++****************************************************************************************/
++void UtilCriticalSectionTerminate(void)
++{
++  /* Only terminate if it was initialized. */
++  if (criticalSectionInitialized)
++  {
++    /* Reset the initialized flag. */
++    criticalSectionInitialized = false;
++    /* Delete the critical section object. */
++    (void)pthread_mutex_destroy((pthread_mutex_t *)&mtxCritSect);
++  }
++} /*** end of UtilCriticalSectionTerminate ***/
++
++
++
++/************************************************************************************//**
++** \brief     Enters a critical section. The functions UtilCriticalSectionEnter and 
++**            UtilCriticalSectionExit should always be used in a pair.
++**
++****************************************************************************************/
++void UtilCriticalSectionEnter(void)
++{
++  /* Check initialization. */
++  assert(criticalSectionInitialized);
++
++  /* Only continue if actually initialized. */
++  if (criticalSectionInitialized)
++  {
++    (void)pthread_mutex_lock((pthread_mutex_t *)&mtxCritSect);
++  }
++} /*** end of UtilCriticalSectionEnter ***/ /*lint !e456 !e454 */
++
++
++/************************************************************************************//**
++** \brief     Leaves a critical section. The functions UtilCriticalSectionEnter and 
++**            UtilCriticalSectionExit should always be used in a pair.
++**
++****************************************************************************************/
++void UtilCriticalSectionExit(void)
++{
++  /* Check initialization. */
++  assert(criticalSectionInitialized);
++
++  /* Only continue if actually initialized. */
++  if (criticalSectionInitialized)
++  {
++    (void)pthread_mutex_unlock((pthread_mutex_t *)&mtxCritSect); /*lint !e455 */
++  }
++} /*** end of UtilCriticalSectionExit ***/
++
++
++/*********************************** end of critutil.c *********************************/
++
+diff --git a/Host/Source/LibOpenBLT/port/darwin/netaccess.c b/Host/Source/LibOpenBLT/port/darwin/netaccess.c
+new file mode 100644
+index 0000000..8edb2d9
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/netaccess.c
+@@ -0,0 +1,332 @@
++/************************************************************************************//**
++* \file         port/darwin/netaccess.c
++* \brief        TCP/IP network access source file.
++* \ingroup      NetAccess
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++*
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <assert.h>                         /* for assertions                          */
++#include <stdint.h>                         /* for standard integer types              */
++#include <stddef.h>                         /* for NULL declaration                    */
++#include <stdbool.h>                        /* for boolean type                        */
++#include <string.h>                         /* for string utilities                    */
++#include <unistd.h>                         /* for close                               */
++#include <sys/socket.h>                     /* for socket                              */
++#include <arpa/inet.h>                      /* for inet_addr                           */
++#include <netdb.h>                          /* for hostent                             */
++#include "netaccess.h"                      /* TCP/IP network access module            */
++
++
++/****************************************************************************************
++* Macro definitions
++****************************************************************************************/
++/** \brief Constant value that indicates that the network socket is invalid. */
++#define NETACCESS_INVALID_SOCKET       (-1)
++
++
++/****************************************************************************************
++* Local data declarations
++****************************************************************************************/
++/** \brief The socket that is used as an endpoint for the TCP/IP network
++ * communication.
++ */
++static int netAccessSocket;
++
++
++/************************************************************************************//**
++** \brief     Initializes the network access module.
++**
++****************************************************************************************/
++void NetAccessInit(void)
++{
++  /* Invalidate the socket. */
++  netAccessSocket = NETACCESS_INVALID_SOCKET;
++} /*** end of NetAccessInit ***/
++
++
++/************************************************************************************//**
++** \brief     Terminates the network access module.
++**
++****************************************************************************************/
++void NetAccessTerminate(void)
++{
++  /* Make sure to disconnect form the server. */
++  NetAccessDisconnect();
++} /*** end of NetAccessTerminate ***/
++
++
++/************************************************************************************//**
++** \brief     Connects to the TCP/IP server at the specified address and the given port.
++** \param     address The address of the server. This can be a hostname (such as
++**            mydomain.com) or an IP address (such as 127.0.0.1).
++** \param     port The port number on the server to connect to.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool NetAccessConnect(char const * address, uint16_t port)
++{
++  bool result = false;
++  struct addrinfo hints = { 0 };
++  struct addrinfo * serverinfo = NULL;
++  struct sockaddr_in serverIPv4 = { 0 };
++  struct sockaddr_in6 serverIPv6 = { 0 };
++  bool serverIPv4found = false;
++  bool serverIPv6found = false;
++  
++  /* Check parameters. */
++  assert(address != NULL);
++  assert(port > 0);
++
++  /* Start by invalidating the socket. */
++  netAccessSocket = NETACCESS_INVALID_SOCKET;
++
++  /* Only continue with valid parameters. */
++  if ( (address != NULL) && (port > 0) ) /*lint !e774 */
++  {
++    /* Set result to true and only reset it to false upon detection of a problem. */
++    result = true;
++
++    /* Initialize hints structure to aid in hostname resolving. Note that AF_UNSPEC is
++     * used to support both IPv4 and IPv6.
++     */
++    hints.ai_family = AF_UNSPEC;
++    hints.ai_socktype = (int)SOCK_STREAM;
++    hints.ai_flags |= AI_CANONNAME;
++
++    /* Attempt to resolve the hostname. This converts the hostname to an IP address, if
++     * it wasn't already an IP address.
++     */
++    if (getaddrinfo(address, NULL, &hints, &serverinfo) != 0)
++    {
++      /* Could not resolve the hostname. */
++      result = false;
++    }
++    /* Sanity check on the pointer that should now be initialized and contain data. */
++    else
++    {
++      if (serverinfo == NULL)
++      {
++        result = false;
++      }
++    }
++    /* The serverinfo pointer now points to an array with results of the hostname
++     * resolving. We only need one, so grab the first valid one. Prefer IPv4 over IPv6.
++     */
++    if (result)
++    {
++      /* Point to the first entry. */
++      struct addrinfo * entry = serverinfo;
++      /* Loop over the entries until a valid one was found. */
++      while (entry != NULL)
++      {
++        /* Does this entry contain an IPv4 address? */
++        if (entry->ai_family == AF_INET)
++        {
++          /* Copy this one for later usage. */
++          memcpy (&serverIPv4, entry->ai_addr, entry->ai_addrlen);
++          serverIPv4.sin_family = AF_INET;
++          serverIPv4.sin_port = htons(port);
++          /* Set flag so we know which socket address variable to use later on. */
++          serverIPv4found = true;
++          /* No need to go over the other entries, since we found a valid one. */
++          break;
++        }
++        /* Does this entry contain an IPv6 address? */
++        if (entry->ai_family == AF_INET6)
++        {
++          /* Copy this one for later usage. */
++          memcpy (&serverIPv6, entry->ai_addr, entry->ai_addrlen);
++          serverIPv6.sin6_family = AF_INET6;
++          serverIPv6.sin6_port = htons(port);
++          /* Set flag so we know which socket address variable to use later on. */
++          serverIPv6found = true;
++          /* No need to go over the other entries, since we found a valid one. */
++          break;
++        }
++        /* Move on to the next one. */
++        entry = entry->ai_next;
++      }
++    }
++    /* Check that a valid entry was found. */
++    if (result)
++    {
++      if ( (!serverIPv4found) && (!serverIPv6found) )
++      {
++        result = false;
++      }
++    }
++    /* Create the socket. */
++    if (result)
++    {
++      /* Create the socket based on the family type. */
++      if (serverIPv4found)
++      {
++        netAccessSocket = socket(serverIPv4.sin_family, (int)SOCK_STREAM, IPPROTO_TCP);
++      }
++      else
++      {
++        netAccessSocket = socket(serverIPv6.sin6_family, (int)SOCK_STREAM, IPPROTO_TCP);
++      }
++      /* Check the socket. */
++      if (netAccessSocket < 0)
++      {
++        /* Could not create the socket. */
++        netAccessSocket = NETACCESS_INVALID_SOCKET;
++        result = false;
++      }
++    }
++    /* Connect the socket. */
++    if (result)
++    {
++      /* Get the socket address pointer based on the family type. */
++      struct sockaddr * server_address;
++      if (serverIPv4found)
++      {
++        server_address = (struct sockaddr *)&serverIPv4; /*lint !e740 */
++      }
++      else
++      {
++        server_address = (struct sockaddr *)&serverIPv6; /*lint !e740 */
++      }
++      /* Attempt to connect. */
++      if (connect(netAccessSocket, server_address, sizeof(struct sockaddr)) < 0)
++      {
++        /* Could not connect. Close the socket and negate result value. */
++        close(netAccessSocket);
++        netAccessSocket = NETACCESS_INVALID_SOCKET;
++        result = false;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of NetAccessConnect ***/
++
++
++/************************************************************************************//**
++** \brief     Disconnects from the TCP/IP server.
++**
++****************************************************************************************/
++void NetAccessDisconnect(void)
++{
++  /* Close the socket if it is open. */
++  if (netAccessSocket >= 0)
++  {
++    close(netAccessSocket);
++    netAccessSocket = NETACCESS_INVALID_SOCKET;
++  }
++} /*** end of NetAccessDisconnect ***/
++
++
++/************************************************************************************//**
++** \brief     Sends data to the TCP/IP server.
++** \param     data Pointer to byte array with data to send.
++** \param     length Number of bytes to send.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool NetAccessSend(uint8_t const * data, uint32_t length)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length > 0);
++
++  /* Only continue with valid parameters. */
++  if ( (data != NULL) && (length > 0) ) /*lint !e774 */
++  {
++    /* Only continue with a valid socket. */
++    if (netAccessSocket >= 0)
++    {
++      /* Attempt to send the data. */
++      if (send(netAccessSocket, data, length, 0) >= 0)
++      {
++        /* Successfully send the data. */
++        result = true;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of NetAccessSend ***/
++
++
++/************************************************************************************//**
++** \brief     Receives data from the TCP/IP server in a blocking manner.
++** \param     data Pointer to byte array to store the received data.
++** \param     length Holds the max number of bytes that can be stored into the byte
++**            array. This function also overwrites this value with the number of bytes
++**            that were actually received.
++** \param     timeout Timeout in milliseconds for the data reception.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool NetAccessReceive(uint8_t * data, uint32_t * length, uint32_t timeout)
++{
++  bool result = false;
++  struct timeval tv;
++  ssize_t receivedLen;
++
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length != NULL);
++  assert(timeout > 0);
++
++  /* Only continue with valid parameters. */
++  if ( (data != NULL) && (length != NULL) && (timeout > 0) ) /*lint !e774 */
++  {
++    /* Only continue with a valid socket. */
++    if (netAccessSocket >= 0)
++    {
++      /* Configure the timeout for the receive operation. */
++      tv.tv_sec = (time_t)(timeout / 1000u);
++      tv.tv_usec = (timeout % 1000u) * 1000u;
++      if (setsockopt(netAccessSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(struct timeval)) >= 0)
++      {
++        /* Attempt to receive data. */
++        receivedLen = recv(netAccessSocket, data, *length, 0);
++        /* Process the result. Everything < 0 indicate that an error occured. A value of
++         * zero is also treated as an error, since data was expected.
++         */
++        if (receivedLen > 0)
++        {
++          /* Store the number of received bytes. */
++          *length = (uint32_t)receivedLen;
++          /* Successfully received data. */
++          result = true;
++        }
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of NetAccessReceive ***/
++
++
++/*********************************** end of netaccess.c ********************************/
++
+diff --git a/Host/Source/LibOpenBLT/port/darwin/serialport.c b/Host/Source/LibOpenBLT/port/darwin/serialport.c
+new file mode 100644
+index 0000000..eecddbc
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/serialport.c
+@@ -0,0 +1,301 @@
++/************************************************************************************//**
++* \file         port/darwin/serialport.c
++* \brief        Serial port source file.
++* \ingroup      SerialPort
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++*
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <assert.h>                         /* for assertions                          */
++#include <stdint.h>                         /* for standard integer types              */
++#include <stddef.h>                         /* for NULL declaration                    */
++#include <stdbool.h>                        /* for boolean type                        */
++#include <unistd.h>                         /* UNIX standard functions                 */
++#include <termios.h>                        /* POSIX terminal control                  */
++#include <fcntl.h>                          /* file control definitions                */
++#include <sys/ioctl.h>                      /* system I/O control                      */
++#include "serialport.h"                     /* serial port module                      */
++
++
++/****************************************************************************************
++* Macro definitions
++****************************************************************************************/
++/** \brief Invalid serial port device handle. */
++#define SERIALPORT_INVALID_HANDLE      (-1)
++
++
++/****************************************************************************************
++* Local data declarations
++****************************************************************************************/
++/** \brief Serial port handle. */
++static int32_t portHandle;
++
++
++/****************************************************************************************
++* Local constant declarations
++****************************************************************************************/
++/** \brief Lookup table for converting this module's generic baudrate value to a value
++ *         supported by the low level interface.
++ */
++static const speed_t baudrateLookup[] =
++{
++  B9600,                                    /**< Index 0 = SERIALPORT_BR9600           */
++  B19200,                                   /**< Index 1 = SERIALPORT_BR19200          */
++  B38400,                                   /**< Index 2 = SERIALPORT_BR38400          */
++  B57600,                                   /**< Index 3 = SERIALPORT_BR57600          */
++  B115200                                   /**< Index 4 = SERIALPORT_BR115200         */
++};
++
++
++/************************************************************************************//**
++** \brief     Initializes the serial port module.
++**
++****************************************************************************************/
++void SerialPortInit(void)
++{
++  /* Invalidate the port handle. */
++  portHandle = SERIALPORT_INVALID_HANDLE;
++} /*** end of SerialPortInit ***/
++
++
++/************************************************************************************//**
++** \brief     Terminates the serial port module.
++**
++****************************************************************************************/
++void SerialPortTerminate(void)
++{
++  /* Make sure the serial port is closed. */
++  SerialPortClose();
++} /*** end of SerialPortTerminate ***/
++
++
++/************************************************************************************//**
++** \brief     Opens the connection with the serial port.
++** \param     portname The name of the serial port to open, i.e. /dev/ttyUSB0.
++** \param     baudrate The desired communication speed.
++** \param     parity The desired parity configuration.
++** \param     stopbits The desired stop bits configuration.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool SerialPortOpen(char const* portname, tSerialPortBaudrate baudrate,
++                    tSerialPortParity parity, tSerialPortStopbits stopbits)
++{
++  bool result = false;
++  struct termios options = { 0 }; 
++  int32_t iFlags;
++
++  /* Check parameters. */
++  assert(portname != NULL);
++  
++  /* Only continue with valid parameters. */
++  if (portname != NULL) /*lint !e774 */
++  {
++    /* Assume the result to be okay from here on and only set it to error when a problem
++     * was detected.
++     */
++    result = true;
++    /* Open the port. */
++    portHandle = open(portname, O_RDWR | O_NOCTTY | O_NDELAY);
++    /* Check the result */
++    if (portHandle == SERIALPORT_INVALID_HANDLE)
++    {
++      result = false;
++    }
++    
++    /* Configure the device to block during read operations. */
++    if (result)
++    {
++      if (fcntl(portHandle, F_SETFL, 0) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++    /* Get the current options for the port. */
++    if (result)
++    {
++      if (tcgetattr(portHandle, &options) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++    /* Configure the baudrate. */
++    if (result)
++    {
++      if (cfsetispeed(&options, baudrateLookup[baudrate]) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++    if (result)
++    {
++      if (cfsetospeed(&options, baudrateLookup[baudrate]) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++
++    if (result)
++    {
++      /* Input modes - clear indicated ones giving: no break, no CR to NL,
++       * no parity check, no strip char, no start/stop output (sic) control.
++       */
++      options.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
++      /* Output modes - clear giving: no post processing such as NL to CR+NL. */
++      options.c_oflag &= ~(OPOST);
++
++      /* Control modes - reset databits and parity configuration. */
++      options.c_cflag &= ~(CSIZE | PARENB | PARODD);
++      /* Control modes - set 8 bit chars. */
++      options.c_cflag |= (CS8);
++      /* Control modes - set stop bits. Default is 1 stop bit. */
++      if (stopbits == SERIALPORT_STOPBITS2)
++      {
++        options.c_cflag |= (CSTOPB);
++      }
++      /* Control modes - set parity. Default is no parity. */
++      if (parity == SERIALPORT_PARITY_ODD)
++      {
++        options.c_cflag |= (PARENB | PARODD); /* Odd parity for I/O.*/
++        options.c_iflag |= (INPCK); /* Enable input parity check. */
++      }
++      else if (parity == SERIALPORT_PARITY_EVEN)
++      {
++        options.c_cflag |= (PARENB); /* Even parity for I/O.*/
++        options.c_iflag |= (INPCK); /* Enable input parity check. */
++      }
++
++      /* Local modes - clear giving: echoing off, canonical off (no erase with
++       * backspace, ^U,...),  no extended functions, no signal chars (^Z,^C).
++       */
++      options.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
++      /* Configure timeouts. */
++      options.c_cc[VMIN]  = 0;
++      options.c_cc[VTIME] = 1; /* in units of 1/10th of a second */
++      /* Set the new options for the port. */
++      if (tcsetattr(portHandle, TCSAFLUSH, &options) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++    /* Turn on DTR. */
++    if (result)
++    {
++      iFlags = TIOCM_DTR;
++      if (ioctl(portHandle, TIOCMBIS, &iFlags) == -1)
++      {
++        SerialPortClose();
++        result = false;
++      }
++    }
++  }
++  
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of SerialPortOpen ***/
++
++
++/************************************************************************************//**
++** \brief     Closes the connection with the serial port.
++**
++****************************************************************************************/
++void SerialPortClose(void)
++{
++  /* Close the port handle if valid. */
++  if (portHandle != SERIALPORT_INVALID_HANDLE)
++  {
++    close(portHandle);
++  }
++  /* Invalidate handle. */
++  portHandle = SERIALPORT_INVALID_HANDLE;
++} /*** end of SerialPortClose ***/
++
++
++/************************************************************************************//**
++** \brief     Writes data to the serial port.
++** \param     data Pointer to byte array with data to write.
++** \param     length Number of bytes to write.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool SerialPortWrite(uint8_t const * data, uint32_t length)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length > 0);
++
++  /* Only continue with valid parameters. */
++  if ( (data != NULL) && (length > 0) ) /*lint !e774 */
++  {
++    /* Submit the data for sending. */
++    if ((uint32_t)write(portHandle, data, length) == length)
++    {
++      result = true;
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of SerialPortWrite ***/
++
++
++/************************************************************************************//**
++** \brief     Reads data from the serial port in a blocking manner.
++** \param     data Pointer to byte array to store read data.
++** \param     length Number of bytes to read.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool SerialPortRead(uint8_t * data, uint32_t length)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length > 0);
++  
++  /* Only continue with valid parameters. */
++  if ( (data != NULL) && (length > 0) ) /*lint !e774 */
++  {
++    /* Attempt to read the requested data. */
++    if ((uint32_t)read(portHandle, data, length) == length)
++    {
++      result = true;
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of SerialPortRead ***/
++
++
++/*********************************** end of serialport.c *******************************/
++
+diff --git a/Host/Source/LibOpenBLT/port/darwin/timeutil.c b/Host/Source/LibOpenBLT/port/darwin/timeutil.c
+new file mode 100644
+index 0000000..7f733cf
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/timeutil.c
+@@ -0,0 +1,73 @@
++/************************************************************************************//**
++* \file         port/darwin/timeutil.c
++* \brief        Time utility source file.
++* \ingroup      Utility
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It 
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++* 
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <stdint.h>                         /* for standard integer types              */
++#include <stddef.h>                         /* for NULL declaration                    */
++#include <stdbool.h>                        /* for boolean type                        */
++#include <unistd.h>                         /* UNIX standard functions                 */
++#include <sys/time.h>                       /* time definitions                        */
++#include "util.h"                           /* Utility module                          */
++
++
++/************************************************************************************//**
++** \brief     Get the system time in milliseconds. Note that the 32-bit unsigned system
++**            time could potentially overflow, which needs to be properly handled by
++**            the caller.
++** \return    Time in milliseconds.
++**
++****************************************************************************************/
++uint32_t UtilTimeGetSystemTimeMs(void)
++{
++  uint32_t result = 0;
++  struct timeval tv;
++
++  if (gettimeofday(&tv, NULL) == 0)
++  {
++    result = (((uint32_t)tv.tv_sec * 1000ul) + ((uint32_t)tv.tv_usec / 1000ul));
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of UtilTimeGetSystemTimeMs ***/
++
++
++/************************************************************************************//**
++** \brief     Performs a delay of the specified amount of milliseconds.
++** \param     delay Delay time in milliseconds.
++**
++****************************************************************************************/
++void UtilTimeDelayMs(uint16_t delay)
++{
++  (void)usleep(1000u * delay);
++} /*** end of UtilTimeDelayMs **/
++
++
++/*********************************** end of timeutil.c *********************************/
++
+diff --git a/Host/Source/LibOpenBLT/port/darwin/usbbulk.c b/Host/Source/LibOpenBLT/port/darwin/usbbulk.c
+new file mode 100644
+index 0000000..995c109
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/usbbulk.c
+@@ -0,0 +1,370 @@
++/************************************************************************************//**
++* \file         port/darwin/usbbulk.c
++* \brief        USB bulk driver source file.
++* \ingroup      XcpTpUsb
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++*
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <assert.h>                         /* for assertions                          */
++#include <stdint.h>                         /* for standard integer types              */
++#include <stddef.h>                         /* for NULL declaration                    */
++#include <stdbool.h>                        /* for boolean type                        */
++#include "usbbulk.h"                        /* USB bulk driver                         */
++#include <libusb-1.0/libusb.h>              /* LibUsb 1.0 driver                       */
++
++
++/****************************************************************************************
++* Macro definitions
++****************************************************************************************/
++/** \brief Size of the internal endpoint read buffer. This should be the same as the size
++ *         of the buffer size of the endpoint on the USB device itself.
++ */
++#define USBBULK_READ_DATA_BUFFER_SIZE    (64u)
++
++
++/****************************************************************************************
++* Local constant declarations
++****************************************************************************************/
++/** \brief Vendor ID of the OpenBLT bootloader as assigned by the OpenMoko project. */
++static const uint16_t openBltVendorId = 0x1D50;
++
++/** \brief Product ID of the OpenBLT bootloader as assigned by the OpenMoko project. */
++static const uint16_t openBltProductId = 0x60AC;
++
++
++/****************************************************************************************
++* Local data declarations
++****************************************************************************************/
++/** \brief LibUsb context. */
++static libusb_context * libUsbCtx;
++
++/** \brief LibUsb device handle. */
++static libusb_device_handle * libUsbDevHandle;
++
++/** \brief Internal endpoint read buffer. With LibUsb endpoint read operations should
++ *         always be attempted with the size of the endpoint buffer on the USB device
++ *         itself.
++ */
++static uint8_t readDataBuffer[USBBULK_READ_DATA_BUFFER_SIZE];
++
++/** \brief Variable that holds the number of bytes that were read from the endpoint, but
++ *         were not yet retrieved from this module via UsbBulkRead().
++ */
++static uint8_t readDataPending;
++
++/** \brief Index into the endpoint read buffer (readDataBuffer[]) that point to the next
++ *         byte value that should be read.
++ */
++static uint8_t readDataCurrentReadIdx;
++
++
++/************************************************************************************//**
++** \brief     Initializes the USB bulk driver.
++**
++****************************************************************************************/
++void UsbBulkInit(void)
++{
++  /* Initialize locals. */
++  libUsbCtx = NULL;
++  libUsbDevHandle = NULL;
++  readDataPending = 0;
++  readDataCurrentReadIdx = 0;
++
++  /* Initialize LibUsb. */
++  if (libusb_init(&libUsbCtx) != (int)LIBUSB_SUCCESS)
++  {
++    /* Error occurred while initializing LibUsb. Invalidate the context. */
++    libUsbCtx = NULL;
++  }
++  /* Only continue initialization with a valid context. */
++  if (libUsbCtx != NULL)
++  {
++    /* Set the log message verbosity as advised by the documentation. */
++#if LIBUSB_API_VERSION >= 0x01000106
++    (void)libusb_set_option(libUsbCtx, LIBUSB_OPTION_LOG_LEVEL, (int)LIBUSB_LOG_LEVEL_WARNING);
++#else
++    libusb_set_debug(libUsbCtx, (int)LIBUSB_LOG_LEVEL_WARNING);
++#endif
++  }
++} /*** end of UsbBulkInit ***/
++
++
++/************************************************************************************//**
++** \brief     Terminates the USB bulk driver.
++**
++****************************************************************************************/
++void UsbBulkTerminate(void)
++{
++  /* Terminate LibUsb. */
++  if (libUsbCtx != NULL)
++  {
++    libusb_exit(libUsbCtx);
++    /* Invalidate the context. */
++    libUsbCtx = NULL;
++  }
++} /*** end of UsbBulkTerminate ***/
++
++
++/************************************************************************************//**
++** \brief     Opens the connection with the USB device.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool UsbBulkOpen(void)
++{
++  bool result = false;
++
++  /* Reset read buffer management variables. */
++  readDataPending = 0;
++  readDataCurrentReadIdx = 0;
++
++  /* Only continue with a valid context. */
++  if (libUsbCtx != NULL)
++  {
++    /* Set the result to okay and only update it in case of an error from here on. */
++    result = true;
++    /* Attempt to open the USB device. */
++    libUsbDevHandle = libusb_open_device_with_vid_pid(libUsbCtx, openBltVendorId,
++                                                      openBltProductId);
++    /* Check if the USB device could be opened. */
++    if (libUsbDevHandle == NULL)
++    {
++      /* Update result. */
++      result = false;
++    }
++    /* Before the USB device can be claimed, it cannot be attached to a kernel driver. */
++    if (result)
++    {
++      if (libusb_kernel_driver_active(libUsbDevHandle, 0) == 1)
++      {
++        /* Kernel driver active, so detach it. */
++        (void)libusb_detach_kernel_driver(libUsbDevHandle, 0);
++      }
++    }
++    /* Attempt to claim the interface. */
++    if (result)
++    {
++      if (libusb_claim_interface(libUsbDevHandle, 0) != (int)LIBUSB_SUCCESS)
++      {
++        result = false;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of UsbBulkOpen ***/
++
++
++/************************************************************************************//**
++** \brief     Closes the connection with the USB device.
++**
++****************************************************************************************/
++void UsbBulkClose(void)
++{
++  /* Release the interface and close the connection with the USB device. */
++  if (libUsbDevHandle != NULL)
++  {
++    (void)libusb_release_interface(libUsbDevHandle, 0);
++    libusb_close(libUsbDevHandle);
++    /* Invalidate the handler. */
++    libUsbDevHandle = NULL;
++  }
++} /*** end of UsbBulkClose ***/
++
++
++/************************************************************************************//**
++** \brief     Writes data to the USB device.
++** \param     data Pointer to byte array with data to write.
++** \param     length Number of bytes in the data array.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool UsbBulkWrite(uint8_t const * data, uint16_t length)
++{
++  bool result = false;
++  
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length > 0);
++  
++  /* Only continue with valid parameters. */
++  if ((data != NULL) && (length > 0)) /*lint !e774 */
++  {
++    /* Only continue with a valid context and device handle. */
++    if ( (libUsbDevHandle != NULL) && (libUsbCtx != NULL) )
++    {
++      /* Attempt to write the data to the endpoint. */
++      int bytesWritten = 0;
++      int transferResult = libusb_bulk_transfer(libUsbDevHandle, 0x01, (uint8_t *)data,
++                                                (int)length, &bytesWritten, 0);
++      /* Check the transfer result. */
++      if (transferResult == (int)LIBUSB_SUCCESS)
++      {
++        /* Check if all data was written. */
++        if (bytesWritten == length)
++        {
++          /* Data successfully written the endpoint. */
++          result = true;
++        }
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of UsbBulkWrite ***/
++
++
++/************************************************************************************//**
++** \brief     Reads data from the USB device.
++** \param     data Pointer to byte array where received data should be stored.
++** \param     length Number of bytes to read from the USB device.
++** \param     timeout Timeout in milliseconds for the read operation.
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool UsbBulkRead(uint8_t * data, uint16_t length, uint32_t timeout)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(data != NULL);
++  assert(length > 0);
++  assert(length <= USBBULK_READ_DATA_BUFFER_SIZE);
++
++  /* Only continue with valid parameters. */
++  if ((data != NULL) && (length > 0) &&
++      (length <= USBBULK_READ_DATA_BUFFER_SIZE) ) /*lint !e774 */
++  {
++    /* Only continue with a valid context and device handle. */
++    if ( (libUsbDevHandle != NULL) && (libUsbCtx != NULL) )
++    {
++      uint16_t totalBytesRead = 0;
++      uint8_t * currentWriteDataPtr = data;
++
++      /* First empty out whatever is still pending in the read buffer. */
++      uint16_t bytesPendingInBuffer = length;
++      if (readDataPending < length)
++      {
++        bytesPendingInBuffer = readDataPending;
++      }
++      uint16_t bytesToReadFromDevice = length - bytesPendingInBuffer;
++      /* Copy data. */
++      for (uint16_t idx = 0; idx < bytesPendingInBuffer; idx++)
++      {
++        /* Sanity check for the current read indexer/ */
++        assert(readDataCurrentReadIdx < USBBULK_READ_DATA_BUFFER_SIZE);
++        /* Only copy data if current read indexer is not out of bounds. */
++        if (readDataCurrentReadIdx < USBBULK_READ_DATA_BUFFER_SIZE)
++        {
++          *currentWriteDataPtr = readDataBuffer[readDataCurrentReadIdx];
++        }
++        /* Update total bytes read counter. */
++        totalBytesRead++;
++        /* Increment the write data pointer. */
++        currentWriteDataPtr++;
++        /* Increment current read indexer. */
++        readDataCurrentReadIdx++;
++        /* Sanity check for data pending counter. */
++        assert(readDataPending > 0);
++        /* Decrement data pending counter. */
++        if (readDataPending > 0)
++        {
++          readDataPending--;
++        }
++      }
++
++      /* If more data is still to be read, then perform a read operation of the full
++       * endpoint size.
++       */
++      if (bytesToReadFromDevice > 0)
++      {
++        /* Sanity check. */
++        assert(readDataPending == 0);
++
++        /* Attempt to read data from the endpoint. Should be done in steps of the
++         * endpoint buffer size on the target. This is 64 for OpenBLT so exactly the size
++         * of our read buffer.
++         */
++        int bytesRead = 0;
++        int transferResult = libusb_bulk_transfer(libUsbDevHandle, 0x81, readDataBuffer,
++                                                  USBBULK_READ_DATA_BUFFER_SIZE,
++                                                  &bytesRead, timeout);
++        if (transferResult == (int)LIBUSB_SUCCESS)
++        {
++          /* Update read buffer management. */
++          readDataPending = (uint8_t)bytesRead;
++          readDataCurrentReadIdx = 0;
++        }
++      }
++
++      /* Copy remaining data from the newly read data buffer contents as long as they
++       * are present.
++       */
++      uint16_t bytesToCopy = bytesToReadFromDevice;
++      if (readDataPending < bytesToCopy)
++      {
++        bytesToCopy = readDataPending;
++      }
++      /* Copy data. */
++      for (uint16_t idx = 0; idx < bytesToCopy; idx++)
++      {
++        /* Sanity check for the current read indexer/ */
++        assert(readDataCurrentReadIdx < USBBULK_READ_DATA_BUFFER_SIZE);
++        /* Only copy data if current read indexer is not out of bounds. */
++        if (readDataCurrentReadIdx < USBBULK_READ_DATA_BUFFER_SIZE)
++        {
++          *currentWriteDataPtr = readDataBuffer[readDataCurrentReadIdx];
++        }
++        /* Update total bytes read counter. */
++        totalBytesRead++;
++        /* Increment the write data pointer. */
++        currentWriteDataPtr++;
++        /* Increment current read indexer. */
++        readDataCurrentReadIdx++;
++        /* Sanity check for data pending counter. */
++        assert(readDataPending > 0);
++        /* Decrement data pending counter. */
++        if (readDataPending > 0)
++        {
++          readDataPending--;
++        }
++      }
++
++      /* As a final step, check that all requested data bytes were read. */
++      if (totalBytesRead == length)
++      {
++        result = true;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of UsbBulkRead ***/
++
++
++/*********************************** end of usbbulk.c **********************************/
++
+diff --git a/Host/Source/LibOpenBLT/port/darwin/xcpprotect.c b/Host/Source/LibOpenBLT/port/darwin/xcpprotect.c
+new file mode 100644
+index 0000000..f7e71ea
+--- /dev/null
++++ b/Host/Source/LibOpenBLT/port/darwin/xcpprotect.c
+@@ -0,0 +1,194 @@
++/************************************************************************************//**
++* \file         port/darwin/xcpprotect.c
++* \brief        XCP Protection module source file.
++* \ingroup      XcpLoader
++* \internal
++*----------------------------------------------------------------------------------------
++*                          C O P Y R I G H T
++*----------------------------------------------------------------------------------------
++*   Copyright (c) 2017  by Feaser    http://www.feaser.com    All rights reserved
++*
++*----------------------------------------------------------------------------------------
++*                            L I C E N S E
++*----------------------------------------------------------------------------------------
++* This file is part of OpenBLT. OpenBLT is free software: you can redistribute it and/or
++* modify it under the terms of the GNU General Public License as published by the Free
++* Software Foundation, either version 3 of the License, or (at your option) any later
++* version.
++*
++* OpenBLT is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++* PURPOSE. See the GNU General Public License for more details.
++*
++* You have received a copy of the GNU General Public License along with OpenBLT. It
++* should be located in ".\Doc\license.html". If not, contact Feaser to obtain a copy.
++*
++* \endinternal
++****************************************************************************************/
++
++/****************************************************************************************
++* Include files
++****************************************************************************************/
++#include <assert.h>                         /* for assertions                          */
++#include <stdint.h>                         /* for standard integer types              */
++#include <stddef.h>                         /* for NULL declaration                    */
++#include <stdbool.h>                        /* for boolean type                        */
++#include <dlfcn.h>                          /* for dynamic loading                     */
++#include "xcpprotect.h"                     /* XCP protection module                   */
++
++
++/****************************************************************************************
++* Type definitions
++****************************************************************************************/
++/* Seed and key shared library function types. */
++typedef uint32_t ( * tXcpProtectLibComputeKey)(uint8_t resource, uint8_t seedLen, 
++                                               uint8_t const * seedPtr, 
++                                               uint8_t * keyLenPtr, uint8_t * keyPtr);
++typedef uint32_t ( * tXcpProtectLibGetPrivileges)(uint8_t * resourcePtr);
++
++
++/****************************************************************************************
++* Local data declarations
++****************************************************************************************/
++/** \brief Handle to the dynamically loaded seed and key shared library. It can also be
++ *         used as a flag to determine if the shared library was specified and success-
++ *         fully loaded.
++ */
++static void * seedNKeyLibraryHandle;
++
++/** \brief Function pointer to the XCP_ComputeKeyFromSeed shared library function. */
++static tXcpProtectLibComputeKey xcpProtectLibComputeKey;
++
++/** \brief Function pointer to the XCP_GetAvailablePrivileges shared library function. */
++static tXcpProtectLibGetPrivileges xcpProtectLibGetPrivileges;
++
++
++/************************************************************************************//**
++** \brief     Initializes the XCP protection module.
++** \param     seedKeyFile Filename of the seed and key shared library that contains the
++**            following functions:
++**            - XCP_ComputeKeyFromSeed()
++**            - XCP_GetAvailablePrivileges()
++**
++****************************************************************************************/
++void XcpProtectInit(char const * seedKeyFile)
++{
++  /* Init locals. */
++  seedNKeyLibraryHandle = NULL;
++  /* Reset library function pointers. */
++  xcpProtectLibComputeKey = NULL;
++  xcpProtectLibGetPrivileges = NULL;
++
++  /* Only load the shared library is a valid file was specified. */
++  if (seedKeyFile != NULL)
++  {
++    /* Attempt to load the shared library. */
++    seedNKeyLibraryHandle = dlopen(seedKeyFile, RTLD_LAZY);
++    /* Load the function pointers from the shared library. */
++    if (seedNKeyLibraryHandle != NULL)
++    {
++      xcpProtectLibComputeKey = dlsym(seedNKeyLibraryHandle,
++                                      "XCP_ComputeKeyFromSeed");
++      xcpProtectLibGetPrivileges = dlsym(seedNKeyLibraryHandle,
++                                         "XCP_GetAvailablePrivileges");
++    }
++  }
++} /*** end of XcpProtectInit ***/
++
++
++/************************************************************************************//**
++** \brief     Terminates the XCP protection module.
++**
++****************************************************************************************/
++void XcpProtectTerminate(void)
++{
++  /* Reset library function pointers. */
++  xcpProtectLibComputeKey = NULL;
++  xcpProtectLibGetPrivileges = NULL;
++  /* Only unload the shared library if one was loaded. */
++  if (seedNKeyLibraryHandle != NULL)
++  {
++    /* Unload the shared library. */
++    (void)dlclose(seedNKeyLibraryHandle);
++    /* Reset the handle. */
++    seedNKeyLibraryHandle = NULL;
++  }
++} /*** end of XcpProtectTerminate ***/
++
++
++/************************************************************************************//**
++** \brief     Computes the key for the requested resource.
++** \param     resource resource for which the unlock key is requested
++** \param     seedLen  length of the seed
++** \param     seedPtr  pointer to the seed data
++** \param     keyLenPtr pointer where to store the key length
++** \param     keyPtr pointer where to store the key data
++** \return    True if successful, false otherwise.
++**
++****************************************************************************************/
++bool XCPProtectComputeKeyFromSeed(uint8_t resource, uint8_t seedLen,
++                                  uint8_t const * seedPtr, uint8_t * keyLenPtr,
++                                  uint8_t * keyPtr)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(seedLen > 0);
++  assert(seedPtr != NULL);
++  assert(keyLenPtr != NULL);
++  assert(keyPtr != NULL);
++
++  /* Only continue if the parameters are valid. */
++  if ( (seedLen > 0) && (seedPtr != NULL) && (keyLenPtr != NULL) &&
++       (keyPtr != NULL) ) /*lint !e774 */
++  {
++    /* Only continue with a valid function pointer into the shared library. */
++    if (xcpProtectLibComputeKey != NULL)
++    {
++      /* Call the library function. */
++      if (xcpProtectLibComputeKey(resource, seedLen, seedPtr, keyLenPtr, keyPtr) == 0)
++      {
++        /* All good so update the result value accordingly. */
++        result = true;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of XCPProtectComputeKeyFromSeed ***/
++
++
++/************************************************************************************//**
++** \brief     Obtains a bitmask of the resources for which an key algorithm is available.
++** \param     resourcePtr pointer where to store the supported resources for the key
++**                        computation.
++** \return    XCP_RESULT_OK on success, otherwise XCP_RESULT_ERROR.
++**
++****************************************************************************************/
++bool XcpProtectGetPrivileges(uint8_t * resourcePtr)
++{
++  bool result = false;
++
++  /* Check parameters. */
++  assert(resourcePtr != NULL);
++
++  /* Only continue if the parameter is valid. */
++  if (resourcePtr != NULL) /*lint !e774 */
++  {
++    /* Only continue with a valid function pointer into the shared library. */
++    if (xcpProtectLibGetPrivileges != NULL)
++    {
++      /* Call the library function. */
++      if (xcpProtectLibGetPrivileges(resourcePtr) == 0)
++      {
++        /* All good so update the result value accordingly. */
++        result = true;
++      }
++    }
++  }
++  /* Give the result back to the caller. */
++  return result;
++} /*** end of XcpProtectGetPrivileges ***/
++
++
++/*********************************** end of xcpprotect.c *******************************/

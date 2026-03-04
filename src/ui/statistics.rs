@@ -163,6 +163,11 @@ impl MessageStatsWindow {
         self.stats.analyze(messages);
     }
 
+    /// Replace stats with pre-analyzed result (for background loading)
+    pub fn set_stats(&mut self, stats: MessageStatistics) {
+        self.stats = stats;
+    }
+
     pub fn clear(&mut self) {
         self.stats.clear();
     }
@@ -370,6 +375,11 @@ impl PatternAnalyzerWindow {
 
     pub fn analyze(&mut self, messages: &[CanMessage]) {
         self.analyzer.analyze(messages);
+    }
+
+    /// Replace analyzer with pre-analyzed result (for background loading)
+    pub fn set_analyzer(&mut self, analyzer: PatternAnalyzer) {
+        self.analyzer = analyzer;
     }
 
     pub fn clear(&mut self) {

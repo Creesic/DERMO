@@ -4,11 +4,19 @@ use std::time::{Duration, Instant};
 use crate::core::CanMessage;
 use crate::core::dbc::DbcFile;
 
+/// Direction: RX (received) or TX (sent)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MessageDirection {
+    Rx,
+    Tx,
+}
+
 /// State tracking for a single CAN message ID on a specific bus
 #[derive(Clone, Debug)]
 pub struct MessageState {
     pub id: u32,
     pub bus: u8,
+    pub direction: MessageDirection,
     pub name: String,
     pub data: Vec<u8>,
     pub byte_colors: Vec<[f32; 4]>,
@@ -21,11 +29,16 @@ pub struct MessageState {
 }
 
 impl MessageState {
-    pub fn new(id: u32, bus: u8) -> Self {
+    pub fn new(id: u32, bus: u8, direction: MessageDirection) -> Self {
+        let suffix = match direction {
+            MessageDirection::Rx => "",
+            MessageDirection::Tx => " (TX)",
+        };
         Self {
             id,
             bus,
-            name: format!("MSG_0x{:03X}", id),
+            direction,
+            name: format!("MSG_0x{:03X}{}", id, suffix),
             data: Vec::new(),
             byte_colors: Vec::new(),
             count: 0,
@@ -126,14 +139,17 @@ impl MessageState {
     }
 }
 
-/// Window showing live CAN message state - one row per CAN ID (Cabana style)
+/// Key: (CAN ID, bus, direction)
+type MessageKey = (u32, u8, MessageDirection);
+
+/// Window showing live CAN message state - one row per CAN ID + direction (Cabana style)
 pub struct MessageListWindow {
-    /// Map of (CAN ID, bus) to current state
-    states: HashMap<(u32, u8), MessageState>,
+    /// Map of (CAN ID, bus, direction) to current state
+    states: HashMap<MessageKey, MessageState>,
     /// All messages (for full history mode)
     messages: Vec<CanMessage>,
-    /// Selected (CAN ID, bus)
-    selected: Option<(u32, u8)>,
+    /// Selected (CAN ID, bus, direction)
+    selected: Option<MessageKey>,
     /// Display mode
     live_mode: bool,
     /// Filter string
@@ -163,31 +179,54 @@ impl MessageListWindow {
         self.messages = messages;
     }
 
+    /// Append messages (for streaming load)
+    pub fn append_messages(&mut self, msgs: &[CanMessage]) {
+        self.messages.extend_from_slice(msgs);
+    }
+
     pub fn set_dbc(&mut self, dbc: DbcFile) {
         self.dbc_file = Some(dbc);
 
         // Update all existing message names with DBC names
         if let Some(ref dbc) = self.dbc_file {
-            for ((msg_id, _bus), state) in self.states.iter_mut() {
+            for ((msg_id, _bus, _dir), state) in self.states.iter_mut() {
                 if let Some(msg_def) = dbc.get_message(*msg_id) {
-                    // Update to DBC message name
-                    state.name = msg_def.name.clone();
+                    let suffix = match state.direction {
+                        MessageDirection::Rx => "",
+                        MessageDirection::Tx => " (TX)",
+                    };
+                    state.name = format!("{}{}", msg_def.name, suffix);
                 }
             }
         }
     }
 
-    /// Update state with a new message (called during playback)
+    /// Update state with a received message (called during playback/live RX)
     pub fn update_message(&mut self, msg: &CanMessage) {
-        let key = (msg.id, msg.bus);
-        let state = self.states.entry(key).or_insert_with(|| MessageState::new(msg.id, msg.bus));
+        self.update_message_with_direction(msg, MessageDirection::Rx);
+    }
 
-        // Get message name from DBC if available
+    /// Update state with a sent message (called when plugins send)
+    pub fn add_sent_message(&mut self, msg: &CanMessage) {
+        self.update_message_with_direction(msg, MessageDirection::Tx);
+    }
+
+    fn update_message_with_direction(&mut self, msg: &CanMessage, direction: MessageDirection) {
+        let key = (msg.id, msg.bus, direction);
+        let state = self.states.entry(key).or_insert_with(|| MessageState::new(msg.id, msg.bus, direction));
+
+        // Get message name from DBC if available (RX only - TX keeps suffix)
         let msg_name = self.dbc_file.as_ref()
             .and_then(|dbc| dbc.get_message(msg.id))
-            .map(|m| m.name.as_str());
+            .map(|m| {
+                let base = m.name.as_str();
+                match direction {
+                    MessageDirection::Rx => base.to_string(),
+                    MessageDirection::Tx => format!("{} (TX)", base),
+                }
+            });
 
-        state.update(msg, msg_name);
+        state.update(msg, msg_name.as_deref());
     }
 
     /// Clear all states
@@ -201,22 +240,28 @@ impl MessageListWindow {
         self.selected.and_then(|key| self.states.get(&key))
     }
 
-    /// Debug info
-    pub fn debug_info(&self) -> (Option<(u32, u8)>, usize, usize) {
-        (self.selected, self.states.len(), self.messages.len())
+    /// Get latest state for a message by (id, bus) - prefers RX, used for bit visualizer
+    pub fn get_state(&self, id: u32, bus: u8) -> Option<&MessageState> {
+        self.states.get(&(id, bus, MessageDirection::Rx))
+            .or_else(|| self.states.get(&(id, bus, MessageDirection::Tx)))
     }
 
-    pub fn render(&mut self, ui: &Ui, is_open: &mut bool) {
+    /// Debug info
+    pub fn debug_info(&self) -> (Option<(u32, u8)>, usize, usize) {
+        (self.selected.map(|(id, bus, _)| (id, bus)), self.states.len(), self.messages.len())
+    }
+
+    pub fn render(&mut self, ui: &Ui, is_open: &mut bool, is_playing: bool) {
         ui.window("Messages")
             .size([500.0, 400.0], Condition::FirstUseEver)
             .position([10.0, 30.0], Condition::FirstUseEver)
             .opened(is_open)
             .build(|| {
-                self.render_content(ui);
+                self.render_content(ui, is_playing);
             });
     }
 
-    pub fn render_content(&mut self, ui: &Ui) {
+    pub fn render_content(&mut self, ui: &Ui, is_playing: bool) {
         // Mode toggle
         let mut mode = if self.live_mode { 0 } else { 1 };
         if ui.radio_button("Live", &mut mode, 0) {
@@ -247,27 +292,27 @@ impl MessageListWindow {
         ui.separator();
 
         if self.live_mode {
-            self.render_live_mode(ui);
+            self.render_live_mode(ui, is_playing);
         } else {
             self.render_history_mode(ui);
         }
     }
 
-    fn render_live_mode(&mut self, ui: &Ui) {
+    fn render_live_mode(&mut self, ui: &Ui, is_playing: bool) {
         // Header
-        ui.text("ID   Bus   Name              Freq     Count   Data");
+        ui.text("ID   Bus   Dir  Name              Freq     Count   Data");
         ui.separator();
 
         // Collect and sort states
         let filter_lower = self.filter.to_lowercase();
-        let mut sorted_keys: Vec<(u32, u8)> = self.states.keys().cloned().collect();
+        let mut sorted_keys: Vec<MessageKey> = self.states.keys().cloned().collect();
 
         // Apply filter
         if !filter_lower.is_empty() {
-            sorted_keys.retain(|&(id, bus)| {
-                if let Some(state) = self.states.get(&(id, bus)) {
-                    let id_str = format!("0x{:03X}", id);
-                    let bus_str = format!("{}", bus);
+            sorted_keys.retain(|key| {
+                if let Some(state) = self.states.get(key) {
+                    let id_str = format!("0x{:03X}", state.id);
+                    let bus_str = format!("{}", state.bus);
                     let name_lower = state.name.to_lowercase();
                     id_str.to_lowercase().contains(&filter_lower) ||
                     bus_str.contains(&filter_lower) ||
@@ -278,13 +323,14 @@ impl MessageListWindow {
             });
         }
 
-        // Sort
-        sorted_keys.sort_by(|&(id_a, bus_a), &(id_b, bus_b)| {
-            let state_a = self.states.get(&(id_a, bus_a)).unwrap();
-            let state_b = self.states.get(&(id_b, bus_b)).unwrap();
-            let cmp = match self.sort_column {
-                0 => id_a.cmp(&id_b),
-                1 => bus_a.cmp(&bus_b),
+        // Sort - use stable sort (ID only) during playback so list doesn't jump when freq/count update
+        let effective_sort_col = if is_playing { 0 } else { self.sort_column };
+        sorted_keys.sort_by(|&(id_a, bus_a, dir_a), &(id_b, bus_b, dir_b)| {
+            let state_a = self.states.get(&(id_a, bus_a, dir_a)).unwrap();
+            let state_b = self.states.get(&(id_b, bus_b, dir_b)).unwrap();
+            let cmp = match effective_sort_col {
+                0 => id_a.cmp(&id_b).then_with(|| dir_a.cmp(&dir_b)),
+                1 => bus_a.cmp(&bus_b).then_with(|| dir_a.cmp(&dir_b)),
                 2 => state_a.name.cmp(&state_b.name),
                 3 => state_a.freq.partial_cmp(&state_b.freq).unwrap_or(std::cmp::Ordering::Equal),
                 4 => state_a.count.cmp(&state_b.count),
@@ -293,22 +339,44 @@ impl MessageListWindow {
             if self.sort_ascending { cmp } else { cmp.reverse() }
         });
 
-        // Render rows with two columns: ID|Bus|Name|Freq|Count | Data (colored bytes)
+        // Render rows with two columns: ID|Bus|Dir|Name|Freq|Count | Data (colored bytes)
         ui.columns(2, "msg_list_cols", false);
-        ui.set_column_width(0, 360.0);  // Wide enough for ID, Bus, Name (18), Freq (8), Count (6)
+        ui.set_column_width(0, 360.0);  // Wide enough for ID, Bus, Dir, Name (18), Freq (8), Count (6)
 
-        for (id, bus) in sorted_keys {
-            let state = self.states.get(&(id, bus)).unwrap();
-            let is_selected = self.selected == Some((id, bus));
+        for key in sorted_keys {
+            let (id, bus, dir) = key;
+            let state = self.states.get(&key).unwrap();
+            let is_selected = self.selected == Some(key);
 
-            // Column 0: ID, Bus, Name, Freq, Count
+            // TX rows: blue-tinted text to distinguish from RX
+            let dir_str = match dir {
+                MessageDirection::Rx => "RX",
+                MessageDirection::Tx => "TX",
+            };
+            let _tx_color = match dir {
+                MessageDirection::Rx => None,
+                MessageDirection::Tx => Some(ui.push_style_color(StyleColor::Text, [0.4, 0.7, 1.0, 1.0])),
+            };
+
+            // Column 0: ID, Bus, Dir, Name, Freq, Count
             let name_padded = format!("{:<18}", &state.name[..state.name.len().min(18)]);
-            let row_label = format!("0x{:03X}  {}    {}{:>8}  {:>6} ##row_{}_{}",
-                id, bus, name_padded, state.freq_str(), state.count, id, bus);
+            let row_label = format!("0x{:03X}  {}    {}  {}{:>8}  {:>6}",
+                id, bus, dir_str, name_padded, state.freq_str(), state.count);
 
-            if ui.selectable_config(&row_label).selected(is_selected).build() {
-                self.selected = Some((id, bus));
+            // Stable ID + span full row: during rapid playback, (1) label must not change or
+            // ImGui loses the click, (2) full row must be clickable (including colored bytes).
+            let id_scope = ui.push_id(&format!("msg_{}_{}_{:?}", id, bus, dir));
+            let clicked = ui.selectable_config("##row")
+                .selected(is_selected)
+                .span_all_columns(true)
+                .build();
+            if clicked {
+                self.selected = Some(key);
             }
+            // Draw display text over the selectable (text is non-interactive, can change every frame)
+            ui.same_line_with_spacing(0.0, 0.0);
+            ui.text(&row_label);
+            id_scope.pop();
 
             if ui.is_item_hovered() {
                 ui.tooltip(|| {
@@ -404,7 +472,7 @@ impl MessageListWindow {
 
                     if ui.selectable(&label) {
                         eprintln!("MessageList[History]: CLICKED id=0x{:03X}, bus={}", msg.id, msg.bus);
-                        self.selected = Some((msg.id, msg.bus));
+                        self.selected = Some((msg.id, msg.bus, MessageDirection::Rx));
                     }
                 }
             }

@@ -1,6 +1,6 @@
 [package]
 name = "shit"
-version = "0.1.48"
+version = "0.1.51"
 edition = "2021"
 description = "Signal Harvesting & Interpretation Toolkit"
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
@@ -34,6 +34,11 @@ rfd = "0.15"
 # error handling
 anyhow = "1.0"
 thiserror = "2.0"
+
+# UDS Security Key (RSA + MD5)
+num-bigint = "0.4"
+num-traits = "0.2"
+md5 = "0.7"
 
 # utilities
 chrono = { version = "0.4", features = ["serde"] }

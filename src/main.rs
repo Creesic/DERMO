@@ -11,13 +11,13 @@ mod ui;
 
 use core::{CanMessage, DbcFile};
 use decode::SignalDecoder;
-use input::load_file;
 use playback::PlaybackEngine;
 use hardware::CanManagerCollection;
 use hardware::can_manager::ManagerMessage;
 use hardware::can_interface::InterfaceType;
 use plugins::{PluginContext, PluginRegistry};
 use ui::{MessageListWindow, FileDialogs, MultiSignalGraph, HardwareManagerWindow, LiveModeAction, LiveMessageWindow, MessageSenderWindow, MessageStatsWindow, PatternAnalyzerWindow, ShortcutManager, ExportDialog, AboutDialog, BitVisualizerWindow, SignalInfo, LogWindow};
+use ui::statistics::{MessageStatistics, PatternAnalyzer};
 use chrono::{DateTime, Duration, Utc};
 use imgui::{Context, FontConfig, FontSource, Condition};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
@@ -104,12 +104,18 @@ struct AppState {
     loading_total: usize,
     loading_receiver: Option<Receiver<LoadingUpdate>>,
     pending_messages: Option<Arc<Mutex<Vec<CanMessage>>>>,
+    /// Receiver for background stats/analyzer results
+    analysis_receiver: Option<Receiver<(MessageStatistics, PatternAnalyzer)>>,
 }
 
 /// Messages for async loading
 enum LoadingUpdate {
+    /// Progress(current_bytes, total_bytes) - for CSV, total_bytes is file size
     Progress(usize, usize),
-    Complete(Vec<CanMessage>, String),
+    /// Chunk of messages (streaming - UI updates immediately)
+    Chunk(Vec<CanMessage>),
+    /// Load complete (path only - messages already sent via Chunk)
+    Complete(String),
     Error(String),
 }
 
@@ -276,6 +282,7 @@ impl AppState {
             loading_total: 0,
             loading_receiver: None,
             pending_messages: None,
+            analysis_receiver: None,
         }
     }
 
@@ -327,7 +334,18 @@ impl AppState {
     }
 
     fn load_file(&mut self, path: &str) {
-        // Start async loading
+        // Clear previous state before streaming load
+        self.messages.clear();
+        self.playback = PlaybackEngine::new(Vec::new());
+        self.message_list.set_messages(Vec::new());
+        self.file_loaded = false;
+        self.pending_signal_loads.clear();
+        self.charts.clear_data();
+        self.charts.clear_time_range();
+        self.message_stats.clear();
+        self.pattern_analyzer.clear();
+
+        // Start async streaming load
         self.loading = true;
         self.loading_progress = 0.0;
         self.loading_total = 0;
@@ -338,20 +356,24 @@ impl AppState {
         self.loading_receiver = Some(rx);
 
         std::thread::spawn(move || {
-            // Send progress updates during loading
-            match load_file(&path) {
-                Ok(messages) => {
-                    let total = messages.len();
-                    // Send progress updates
-                    for (i, _) in messages.iter().enumerate() {
-                        if i % 10000 == 0 {
-                            let _ = tx.send(LoadingUpdate::Progress(i, total));
-                        }
-                    }
-                    let _ = tx.send(LoadingUpdate::Complete(messages, path));
+            let tx_inner = std::sync::Arc::new(tx);
+            let tx_chunk = tx_inner.clone();
+            let tx_progress = tx_inner.clone();
+            let tx_complete = tx_inner.clone();
+
+            let chunk_cb: input::ChunkCallback = Box::new(move |msgs| {
+                let _ = tx_chunk.send(LoadingUpdate::Chunk(msgs));
+            });
+            let progress_cb: Option<input::ProgressCallback> = Some(Box::new(move |current, total| {
+                let _ = tx_progress.send(LoadingUpdate::Progress(current, total));
+            }));
+
+            match input::load_file_streaming(&path, chunk_cb, progress_cb) {
+                Ok(()) => {
+                    let _ = tx_complete.send(LoadingUpdate::Complete(path));
                 }
                 Err(e) => {
-                    let _ = tx.send(LoadingUpdate::Error(e.to_string()));
+                    let _ = tx_complete.send(LoadingUpdate::Error(e.to_string()));
                 }
             }
         });
@@ -378,13 +400,18 @@ impl AppState {
                         0.0
                     };
                     self.loading_total = total;
+                    let mb_current = current as f32 / 1_000_000.0;
+                    let mb_total = total as f32 / 1_000_000.0;
                     self.status_message = Some(format!(
-                        "Loading... {:.0}% ({}/{})",
-                        self.loading_progress, current, total
+                        "Loading... {:.0}% ({:.1}/{:.1} MB)",
+                        self.loading_progress, mb_current, mb_total
                     ));
                 }
-                LoadingUpdate::Complete(messages, path) => {
-                    self.finish_loading(messages, &path);
+                LoadingUpdate::Chunk(msgs) => {
+                    self.apply_chunk(&msgs);
+                }
+                LoadingUpdate::Complete(path) => {
+                    self.finish_streaming_load(&path);
                     if let Some(savestate) = self.pending_savestate.take() {
                         self.apply_savestate(&savestate);
                     }
@@ -410,6 +437,65 @@ impl AppState {
         }
     }
 
+    /// Apply a chunk of messages from streaming load - UI updates immediately
+    fn apply_chunk(&mut self, msgs: &[CanMessage]) {
+        let is_first = self.messages.is_empty();
+
+        self.messages.extend_from_slice(msgs);
+        self.playback.append_messages(msgs);
+        self.message_list.append_messages(msgs);
+
+        if is_first {
+            self.file_loaded = true;
+            self.initial_data_populated = false;
+            if let (Some(first), Some(last)) = (msgs.first(), msgs.last()) {
+                self.charts.set_data_time_range(first.timestamp, last.timestamp);
+            }
+            self.charts.clear_data();
+            if self.dbc_loaded {
+                for key in self.charts.charted_signals() {
+                    self.pending_signal_loads.insert(key.to_string(), 0);
+                }
+            }
+        } else if let (Some(first), Some(last)) = (self.messages.first(), self.messages.last()) {
+            self.charts.set_data_time_range(first.timestamp, last.timestamp);
+        }
+    }
+
+    /// Finish streaming load (all chunks received)
+    fn finish_streaming_load(&mut self, path: &str) {
+        self.add_recent_can_file(path);
+        let msg_count = self.messages.len();
+
+        let messages = self.messages.clone();
+        let (tx, rx) = channel();
+        self.analysis_receiver = Some(rx);
+        std::thread::spawn(move || {
+            let mut stats = MessageStatistics::new();
+            stats.analyze(&messages);
+            let mut analyzer = PatternAnalyzer::new();
+            analyzer.analyze(&messages);
+            let _ = tx.send((stats, analyzer));
+        });
+
+        self.status_message = Some(format!("Loaded {} messages", msg_count));
+        info!("Loaded {} messages", msg_count);
+    }
+
+    /// Process background analysis results (stats + pattern analyzer)
+    fn process_analysis_results(&mut self) {
+        let receiver = match self.analysis_receiver.take() {
+            Some(r) => r,
+            None => return,
+        };
+        if let Ok((stats, analyzer)) = receiver.try_recv() {
+            self.message_stats.set_stats(stats);
+            self.pattern_analyzer.set_analyzer(analyzer);
+        } else {
+            self.analysis_receiver = Some(receiver);
+        }
+    }
+
     /// Finish loading after background thread completes
     fn finish_loading(&mut self, messages: Vec<CanMessage>, path: &str) {
         self.add_recent_can_file(path);
@@ -428,14 +514,24 @@ impl AppState {
         // Clear chart data but keep selected signals
         self.charts.clear_data();
 
-        // Pre-populate chart with all data if DBC is already loaded
+        // Defer chart population to incremental loading (like "Add to chart") - prevents UI freeze
         if self.dbc_loaded {
-            self.populate_chart_data();
+            for key in self.charts.charted_signals() {
+                self.pending_signal_loads.insert(key.to_string(), 0);
+            }
         }
 
-        // Update message statistics and pattern analyzer
-        self.message_stats.update(&messages);
-        self.pattern_analyzer.analyze(&messages);
+        // Defer stats/analyzer to background thread - prevents main thread freeze
+        let messages_for_analysis = messages.clone();
+        let (tx, rx) = channel();
+        self.analysis_receiver = Some(rx);
+        std::thread::spawn(move || {
+            let mut stats = MessageStatistics::new();
+            stats.analyze(&messages_for_analysis);
+            let mut analyzer = PatternAnalyzer::new();
+            analyzer.analyze(&messages_for_analysis);
+            let _ = tx.send((stats, analyzer));
+        });
 
         self.status_message = Some(format!("Loaded {} messages", msg_count));
         info!("Loaded {} messages", msg_count);
@@ -972,6 +1068,9 @@ fn main() {
                 // Process async loading
                 state.process_loading();
 
+                // Process background analysis results
+                state.process_analysis_results();
+
                 // Update playback
                 state.playback.update(std::time::Duration::from_millis(16));
 
@@ -1251,50 +1350,6 @@ fn main() {
                         }
                     });
 
-                // Loading overlay
-                if state.loading {
-                    let screen_center = [
-                        window_size.width as f32 / hidpi_factor as f32 / 2.0,
-                        window_size.height as f32 / hidpi_factor as f32 / 2.0,
-                    ];
-
-                    // Semi-transparent background
-                    let draw_list = ui.get_background_draw_list();
-                    draw_list.add_rect(
-                        [0.0, 0.0],
-                        [window_size.width as f32 / hidpi_factor as f32, window_size.height as f32 / hidpi_factor as f32],
-                        [0.0, 0.0, 0.0, 0.5],
-                    ).filled(true).build();
-
-                    // Loading text
-                    let loading_text = format!("Loading... {:.0}%", state.loading_progress);
-                    let text_width = loading_text.len() as f32 * 8.0;
-                    draw_list.add_text(
-                        [screen_center[0] - text_width / 2.0, screen_center[1]],
-                        [1.0, 1.0, 1.0, 1.0],
-                        loading_text,
-                    );
-
-                    // Progress bar
-                    let bar_width = 200.0;
-                    let bar_height = 10.0;
-                    let bar_x = screen_center[0] - bar_width / 2.0;
-                    let bar_y = screen_center[1] + 25.0;
-
-                    draw_list.add_rect(
-                        [bar_x, bar_y],
-                        [bar_x + bar_width, bar_y + bar_height],
-                        [0.3, 0.3, 0.3, 1.0],
-                    ).filled(true).rounding(3.0).build();
-
-                    let progress_width = bar_width * (state.loading_progress / 100.0);
-                    draw_list.add_rect(
-                        [bar_x, bar_y],
-                        [bar_x + progress_width, bar_y + bar_height],
-                        [0.3, 0.7, 1.0, 1.0],
-                    ).filled(true).rounding(3.0).build();
-                }
-
                 // Create a dockspace over the main viewport
                 // This allows windows to be docked/rearranged within the main window
                 // Windows can be dragged and docked to different areas, but stay within the app
@@ -1307,10 +1362,10 @@ fn main() {
                     state.message_list.render(&ui, &mut state.show_messages, state.playback.is_playing());
                 }
 
-                if state.show_charts {
-                    // Process incremental data loading
-                    state.process_pending_signal_loads();
+                // Process incremental chart data loading (runs even when charts window is hidden)
+                state.process_pending_signal_loads();
 
+                if state.show_charts {
                     let current_time = state.playback.current_time();
                     ui.window("Charts")
                         .size([600.0, 350.0], Condition::FirstUseEver)
@@ -1730,6 +1785,8 @@ fn main() {
 
                 // About Dialog
                 state.about_dialog.render(&ui);
+
+                // No loading overlay - user can interact with UI while loading (status bar shows progress)
 
                 // Prepare and render
                 platform.prepare_render(&ui, &window);

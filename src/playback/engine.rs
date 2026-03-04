@@ -38,6 +38,11 @@ impl PlaybackEngine {
         self.messages.len()
     }
 
+    /// Append messages (for streaming load). Messages must be in timestamp order.
+    pub fn append_messages(&mut self, msgs: &[CanMessage]) {
+        self.messages.extend_from_slice(msgs);
+    }
+
     /// Get current playback state
     pub fn state(&self) -> PlaybackState {
         self.state

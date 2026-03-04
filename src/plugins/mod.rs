@@ -7,10 +7,12 @@
 
 mod bench;
 mod gdi;
+mod uds_security;
 mod wideband;
 
 pub use bench::RusefiBenchPlugin;
 pub use gdi::RusefiGdiPlugin;
+pub use uds_security::UdsSecurityPlugin;
 pub use wideband::RusefiWidebandPlugin;
 
 use imgui::Ui;
@@ -74,6 +76,7 @@ impl PluginRegistry {
         // Register built-in plugins
         registry.register(Box::new(RusefiBenchPlugin::new()));
         registry.register(Box::new(RusefiGdiPlugin::new()));
+        registry.register(Box::new(UdsSecurityPlugin::new()));
         registry.register(Box::new(RusefiWidebandPlugin::new()));
         registry
     }
