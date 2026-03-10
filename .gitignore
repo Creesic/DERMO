@@ -2,3 +2,4 @@
 .DS_Store
 *.csv
 !130b.csv
+.cursor/hooks/state/continual-learning.json
