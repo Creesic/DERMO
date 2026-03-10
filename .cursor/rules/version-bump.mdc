@@ -1,0 +1,8 @@
+---
+description: Increment version in Cargo.toml when user asks to build and run
+alwaysApply: true
+---
+
+# Version bump on build-and-run
+
+When the user asks to "build and run" (or similar), increment the version number in `Cargo.toml` before running `cargo build` and `cargo run`.

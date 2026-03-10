@@ -1,6 +1,7 @@
 use imgui::{StyleColor, Ui, MouseButton};
 use chrono::{DateTime, Utc, Duration};
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 
 /// A single data series for plotting
 #[derive(Clone)]
@@ -123,7 +124,8 @@ pub struct MultiSignalGraph {
     series: HashMap<String, DataSeries>,  // Key: "signal_name@busN"
     available_signals: Vec<SignalInfo>,
     show_legend: bool,
-    shared_y_axis: bool,
+    /// Signal keys that share a Y axis (2+ required for effect)
+    shared_y_signals: HashSet<String>,
     time_window_secs: f32,
     graph_height: f32,
     show_signal_picker: bool,
@@ -148,7 +150,7 @@ impl MultiSignalGraph {
             series: HashMap::new(),
             available_signals: Vec::new(),
             show_legend: true,
-            shared_y_axis: false,
+            shared_y_signals: HashSet::new(),
             time_window_secs: 5.0,
             graph_height: 200.0,
             show_signal_picker: false,
@@ -252,6 +254,7 @@ impl MultiSignalGraph {
     pub fn remove_signal(&mut self, key: &str) {
         self.series.remove(key);
         self.selected_signals.remove(key);
+        self.shared_y_signals.remove(key);
     }
 
     /// Restore chart signals from savestate (keys like "signal@bus0")
@@ -292,6 +295,7 @@ impl MultiSignalGraph {
     pub fn clear(&mut self) {
         self.series.clear();
         self.selected_signals.clear();
+        self.shared_y_signals.clear();
     }
 
     /// Generate a distinct color for a series based on index
@@ -326,7 +330,36 @@ impl MultiSignalGraph {
             self.clear();
         }
         ui.same_line();
-        ui.checkbox("Shared Y", &mut self.shared_y_axis);
+        let shared_count = self.shared_y_signals.len();
+        let preview = if shared_count >= 2 {
+            format!("Shared Y ({})", shared_count)
+        } else {
+            "Shared Y".to_string()
+        };
+        if ui.small_button(&preview) {
+            ui.open_popup("shared_y_popup");
+        }
+        if let Some(_popup) = ui.begin_popup("shared_y_popup") {
+            ui.text("Signals sharing Y axis:");
+            ui.separator();
+            let series_keys: Vec<String> = self.series.keys().cloned().collect();
+            for key in &series_keys {
+                if let Some(series) = self.series.get(key) {
+                    let mut checked = self.shared_y_signals.contains(key);
+                    let label = format!("{} [Bus {}]", series.name, series.bus);
+                    if ui.checkbox(&label, &mut checked) {
+                        if checked {
+                            self.shared_y_signals.insert(key.clone());
+                        } else {
+                            self.shared_y_signals.remove(key);
+                        }
+                    }
+                }
+            }
+            if series_keys.is_empty() {
+                ui.text_colored([0.5, 0.5, 0.5, 1.0], "  (no signals charted)");
+            }
+        }
         ui.same_line();
         ui.text("    ");  // spacing
         ui.same_line();
@@ -466,13 +499,22 @@ impl MultiSignalGraph {
             (start, end)
         };
 
-        // Calculate overall value range for the visible window
-        let mut overall_min = f64::INFINITY;
-        let mut overall_max = f64::NEG_INFINITY;
-        for series in self.series.values().filter(|s| s.visible) {
-            let (min, max) = series.get_value_range_in_window(time_start, time_end);
-            overall_min = overall_min.min(min);
-            overall_max = overall_max.max(max);
+        // Shared Y range: only for signals in shared_y_signals that are visible (2+ required)
+        let shared_visible_count = self.series.iter()
+            .filter(|(k, s)| s.visible && self.shared_y_signals.contains(*k))
+            .count();
+        let mut shared_min = f64::INFINITY;
+        let mut shared_max = f64::NEG_INFINITY;
+        if shared_visible_count >= 2 {
+            for (key, series) in self.series.iter().filter(|(k, s)| s.visible && self.shared_y_signals.contains(*k)) {
+                let (min, max) = series.get_value_range_in_window(time_start, time_end);
+                shared_min = shared_min.min(min);
+                shared_max = shared_max.max(max);
+            }
+        }
+        if shared_min == f64::INFINITY {
+            shared_min = 0.0;
+            shared_max = 1.0;
         }
 
         // Draw vertical grid lines (always)
@@ -482,12 +524,12 @@ impl MultiSignalGraph {
             draw_list.add_line([x, pos_min[1]], [x, pos_max[1]], grid_color).build();
         }
 
-        if self.shared_y_axis {
-            self.draw_grid(&draw_list, pos_min, pos_max, overall_min, overall_max);
+        if shared_visible_count >= 2 {
+            self.draw_grid(&draw_list, pos_min, pos_max, shared_min, shared_max);
         }
 
         // Draw each visible series (min-max per-pixel decimation: preserves full vertical range at every pixel column)
-        for series in self.series.values() {
+        for (key, series) in self.series.iter() {
             if !series.visible {
                 continue;
             }
@@ -511,17 +553,18 @@ impl MultiSignalGraph {
                 pos_max,
             );
 
-            let (min_val, max_val) = if self.shared_y_axis {
-                (overall_min, overall_max)
+            let use_shared = self.shared_y_signals.contains(key) && shared_visible_count >= 2;
+            let (min_val, max_val) = if use_shared {
+                (shared_min, shared_max)
             } else {
                 (range_min, range_max)
             };
 
             // Re-map trend/envelope y coords when shared axis (downsample used per-series range)
-            let (trend_points, envelope_lines) = if self.shared_y_axis {
+            let (trend_points, envelope_lines) = if use_shared {
                 let remap_y = |y: f32| self.value_to_y(
                     self.y_to_value(y, range_min, range_max, pos_min, pos_max),
-                    overall_min, overall_max, pos_min, pos_max
+                    shared_min, shared_max, pos_min, pos_max
                 );
                 let trend: Vec<_> = trend_points.iter().map(|[x, y]| [*x, remap_y(*y)]).collect();
                 let env: Vec<_> = envelope_lines.iter()
@@ -572,7 +615,7 @@ impl MultiSignalGraph {
             format!("{:.0}s", end_offset));
 
         // Draw signal-specific Y-axis labels on top (after all other drawing)
-        if !self.shared_y_axis {
+        if shared_visible_count < 2 {
             self.draw_signal_y_labels(&draw_list, pos_min, pos_max, time_start, time_end);
         }
 
@@ -580,6 +623,11 @@ impl MultiSignalGraph {
         ui.dummy(size);
 
         // Handle chart scrubbing - check if mouse is in the chart area
+        // Skip interaction when Shared Y popup is open (clicks would scrub instead of toggling)
+        let shared_y_popup_open = {
+            let id = CString::new("shared_y_popup").unwrap();
+            unsafe { imgui::sys::igIsPopupOpen_Str(id.as_ptr(), 0) }
+        };
         let mouse_pos = ui.io().mouse_pos;
         let is_in_chart = mouse_pos[0] >= pos_min[0] && mouse_pos[0] <= pos_max[0] &&
                           mouse_pos[1] >= pos_min[1] && mouse_pos[1] <= pos_max[1];
@@ -607,35 +655,91 @@ impl MultiSignalGraph {
             }
 
             // Draw value at intersection for each visible signal (color-coordinated)
+            // Collect labels first, then resolve overlaps before drawing
             let label_offset = 6.0;
-            for series in self.series.values().filter(|s| s.visible) {
+            const LABEL_PAD_Y: f32 = 6.0;
+            const LABEL_HEIGHT: f32 = 14.0;  // 6 + 8
+
+            let mut labels: Vec<(f64, f32, String, [f32; 4], f32)> = Vec::new();
+            for (key, series) in self.series.iter().filter(|(_, s)| s.visible) {
                 if let Some(value) = series.get_value_at_time(mouse_time) {
-                    let (min_val, max_val) = if self.shared_y_axis {
-                        (overall_min, overall_max)
+                    let use_shared = self.shared_y_signals.contains(key) && shared_visible_count >= 2;
+                    let (min_val, max_val) = if use_shared {
+                        (shared_min, shared_max)
                     } else {
                         series.get_value_range_in_window(time_start, time_end)
                     };
                     let y_pos = self.value_to_y(value, min_val, max_val, pos_min, pos_max);
                     let label = format!("{:.1}", value);
                     let text_w = label.len() as f32 * 7.0;
-                    // Place to the right of line; if that overflows, place to the left
-                    let text_x = if preview_x + label_offset + text_w < pos_max[0] - 5.0 {
-                        preview_x + label_offset
-                    } else {
-                        preview_x - label_offset - text_w
-                    };
-                    // Small dark background for readability
-                    draw_list.add_rect(
-                        [text_x - 2.0, y_pos - 6.0],
-                        [text_x + text_w + 2.0, y_pos + 8.0],
-                        [0.1, 0.1, 0.1, 0.9]
-                    ).filled(true).rounding(2.0).build();
-                    draw_list.add_text([text_x, y_pos - 6.0], series.color, label);
+                    labels.push((value, y_pos, label, series.color, text_w));
                 }
             }
 
+            // Sort by y_pos so we process top-to-bottom
+            labels.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Resolve overlaps: adjust y so labels don't overlap, keep within chart bounds
+            let mut placed: Vec<(f32, f32)> = Vec::new();
+            for (_, y_center, _, _, _text_w) in labels.iter_mut() {
+                let mut adjusted = *y_center;
+                let y_min = pos_min[1] + LABEL_PAD_Y;
+                let y_max = pos_max[1] - 8.0;
+
+                for _ in 0..32 {
+                    let top = adjusted - LABEL_PAD_Y;
+                    let bottom = adjusted + 8.0;
+                    let overlaps = placed.iter().any(|(p_top, p_bottom)| {
+                        top < *p_bottom && bottom > *p_top
+                    });
+                    if !overlaps {
+                        break;
+                    }
+                    let space_above = top - pos_min[1];
+                    let space_below = pos_max[1] - bottom;
+                    if space_above >= LABEL_HEIGHT {
+                        adjusted -= LABEL_HEIGHT;
+                    } else if space_below >= LABEL_HEIGHT {
+                        adjusted += LABEL_HEIGHT;
+                    } else {
+                        if space_above >= space_below {
+                            adjusted -= 2.0;
+                        } else {
+                            adjusted += 2.0;
+                        }
+                    }
+                    adjusted = adjusted.clamp(y_min, y_max);
+                }
+
+                let top = adjusted - LABEL_PAD_Y;
+                let bottom = adjusted + 8.0;
+                placed.push((top, bottom));
+                *y_center = adjusted;
+            }
+
+            // Draw labels at resolved positions
+            for (_, y_pos, label, color, text_w) in &labels {
+                let text_x = if preview_x + label_offset + text_w < pos_max[0] - 5.0 {
+                    preview_x + label_offset
+                } else {
+                    preview_x - label_offset - text_w
+                };
+                let top = y_pos - LABEL_PAD_Y;
+                let left = text_x - 2.0;
+                let right = text_x + text_w + 2.0;
+                let bottom = y_pos + 8.0;
+
+                draw_list.add_rect(
+                    [left, top],
+                    [right, bottom],
+                    [0.1, 0.1, 0.1, 0.9]
+                ).filled(true).rounding(2.0).build();
+                draw_list.add_text([text_x, top], *color, label);
+            }
+
             // Handle click-to-seek - move yellow line to where the dotted line is
-            if ui.is_mouse_clicked(imgui::MouseButton::Left) {
+            // Skip when Shared Y popup is open (clicks on checkboxes would scrub)
+            if !shared_y_popup_open && ui.is_mouse_clicked(imgui::MouseButton::Left) {
                 if let Some(ct) = current_time {
                     // Calculate relative offset from current time (yellow line) to mouse position
                     let seek_offset_secs = (mouse_time - ct).num_milliseconds() as f32 / 1000.0;
@@ -645,7 +749,7 @@ impl MultiSignalGraph {
         }
 
         // Legend (always shown)
-        self.draw_legend(ui, time_start, time_end);
+        self.draw_legend(ui, current_time, time_start, time_end);
     }
 
     fn render_signal_picker(&mut self, ui: &Ui) {
@@ -889,23 +993,26 @@ impl MultiSignalGraph {
         // Reserve space (using dummy, but we'll track mouse state manually)
         ui.dummy([width, height]);
 
-        // Get mouse state
+        // Get mouse state - skip when Shared Y popup is open
+        let shared_y_popup_open = {
+            let id = CString::new("shared_y_popup").unwrap();
+            unsafe { imgui::sys::igIsPopupOpen_Str(id.as_ptr(), 0) }
+        };
         let mouse_pos = ui.io().mouse_pos;
         let is_hovered = mouse_pos[0] >= bg_min[0] && mouse_pos[0] <= bg_max[0] &&
                           mouse_pos[1] >= bg_min[1] && mouse_pos[1] <= bg_max[1];
         let is_mouse_clicked = ui.is_mouse_clicked(imgui::MouseButton::Left);
-        let is_mouse_down = ui.is_mouse_down(imgui::MouseButton::Left);
         let is_mouse_released = ui.is_mouse_released(imgui::MouseButton::Left);
 
         // Update dragging state (works even when mouse is outside)
-        if is_mouse_clicked && is_hovered {
+        if !shared_y_popup_open && is_mouse_clicked && is_hovered {
             self.timeline_dragging = true;
         }
-        if is_mouse_released {
+        if is_mouse_released || shared_y_popup_open {
             self.timeline_dragging = false;
         }
 
-        let is_active = self.timeline_dragging;
+        let is_active = self.timeline_dragging && !shared_y_popup_open;
 
         // Grab color
         let grab_color = if is_active {
@@ -974,23 +1081,26 @@ impl MultiSignalGraph {
         let grab_min = [grab_x - grab_size / 2.0, bg_min[1] + 2.0];
         let grab_max = [grab_x + grab_size / 2.0, bg_max[1] - 2.0];
 
-        // Check interaction state
+        // Check interaction state - skip when Shared Y popup is open (prevents zoom reset on checkbox click)
+        let shared_y_popup_open = {
+            let id = CString::new("shared_y_popup").unwrap();
+            unsafe { imgui::sys::igIsPopupOpen_Str(id.as_ptr(), 0) }
+        };
         let mouse_pos = ui.io().mouse_pos;
         let is_hovered = mouse_pos[0] >= bg_min[0] && mouse_pos[0] <= bg_max[0] &&
                           mouse_pos[1] >= bg_min[1] && mouse_pos[1] <= bg_max[1];
-        let is_clicked = is_hovered && ui.is_mouse_clicked(MouseButton::Left);
-        let mouse_down = ui.is_mouse_down(MouseButton::Left);
+        let is_clicked = !shared_y_popup_open && is_hovered && ui.is_mouse_clicked(MouseButton::Left);
         let mouse_released = ui.is_mouse_released(MouseButton::Left);
 
         // Update dragging state
         if is_clicked {
             self.slider_dragging = true;
-        } else if mouse_released {
+        } else if mouse_released || shared_y_popup_open {
             self.slider_dragging = false;
         }
 
-        // Active if currently being dragged
-        let is_active = self.slider_dragging;
+        // Active if currently being dragged (and popup not open)
+        let is_active = self.slider_dragging && !shared_y_popup_open;
 
         // Grab color
         let grab_color = if is_active {
@@ -1027,7 +1137,7 @@ impl MultiSignalGraph {
         changed
     }
 
-    fn draw_legend(&mut self, ui: &Ui, time_start: DateTime<Utc>, time_end: DateTime<Utc>) {
+    fn draw_legend(&mut self, ui: &Ui, current_time: Option<DateTime<Utc>>, _time_start: DateTime<Utc>, _time_end: DateTime<Utc>) {
         ui.separator();
         ui.text("Signals:");
 
@@ -1039,21 +1149,30 @@ impl MultiSignalGraph {
         for (idx, name) in series_names.iter().enumerate() {
             if let Some(series) = self.series.get(name) {
                 ui.same_line();
-                ui.color_button("##color", series.color);
-                ui.same_line();
+                ui.group(|| {
+                    ui.color_button("##color", series.color);
+                    ui.same_line();
 
-                let mut visible = series.visible;
-                let _id = ui.push_id_int(idx as i32);
-                if ui.checkbox(&series.name, &mut visible) {
-                    visibility_changes.push((name.clone(), visible));
-                }
+                    let mut visible = series.visible;
+                    let _id = ui.push_id_int(idx as i32);
+                    if ui.checkbox(&series.name, &mut visible) {
+                        visibility_changes.push((name.clone(), visible));
+                    }
 
-                ui.same_line();
+                    ui.same_line();
 
-                // X button to remove
-                if ui.small_button("x") {
-                    to_remove.push(name.clone());
-                }
+                    // X button to remove
+                    if ui.small_button("x") {
+                        to_remove.push(name.clone());
+                    }
+
+                    // Value at current time (below the name, at vertical yellow line)
+                    if let Some(ct) = current_time {
+                        if let Some(val) = series.get_value_at_time(ct) {
+                            ui.text_colored([0.7, 0.7, 0.7, 1.0], format!("{:.4}", val));
+                        }
+                    }
+                });
             }
         }
 
