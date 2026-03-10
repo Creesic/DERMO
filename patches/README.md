@@ -11,7 +11,7 @@ If you clone OpenBLT fresh and need the Darwin port:
 ```bash
 git clone --depth 1 https://github.com/feaser/openblt.git /path/to/openblt
 cd /path/to/openblt
-git apply /path/to/S.H.I.T/patches/openblt-darwin.patch
+git apply /path/to/DERMO/patches/openblt-darwin.patch
 ```
 
 Or use the project's `ext/openblt` which already has the patch applied.

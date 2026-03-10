@@ -441,13 +441,13 @@ impl AboutDialog {
             return;
         }
 
-        ui.window("About S.H.I.T")
+        ui.window("About DERMO")
             .size([400.0, 300.0], Condition::FirstUseEver)
             .build(|| {
-                ui.text("S.H.I.T");
+                ui.text("DERMO");
                 ui.text_colored([0.7, 0.7, 0.7, 1.0], "Version 0.1.0");
                 ui.separator();
-                ui.text("Signal Harvesting & Interpretation Toolkit");
+                ui.text("DERMO - CAN signal viewer and analyzer");
                 ui.text("A cross-platform CAN bus visualization tool");
                 ui.text("similar to comma.ai's Cabana.");
                 ui.separator();

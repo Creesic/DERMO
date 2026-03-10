@@ -22,7 +22,7 @@ pub const FIRMWARE_FILE_FILTERS: &[(&str, &[&str])] = &[
     ("All Files", &["*"]),
 ];
 
-/// File dialog helper for S.H.I.T
+/// File dialog helper for DERMO
 pub struct FileDialogs;
 
 impl FileDialogs {

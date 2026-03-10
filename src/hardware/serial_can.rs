@@ -78,9 +78,9 @@ impl SerialCanInterface {
     pub fn list_serial_ports() -> Vec<String> {
         let ports = tokio_serial::available_ports()
             .unwrap_or_default();
-        eprintln!("[S.H.I.T] Found {} serial ports:", ports.len());
+        eprintln!("[DERMO] Found {} serial ports:", ports.len());
         for p in &ports {
-            eprintln!("[S.H.I.T]   - {}", p.port_name);
+            eprintln!("[DERMO]   - {}", p.port_name);
         }
         ports.into_iter()
             .map(|p| p.port_name)

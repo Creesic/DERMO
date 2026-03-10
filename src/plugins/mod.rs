@@ -1,7 +1,7 @@
 //! Plugin system for extensible hardware and protocol support
 //!
 //! Plugins provide modular windows that can interact with CAN hardware,
-//! decode protocol-specific messages, and extend S.H.I.T functionality.
+//! decode protocol-specific messages, and extend DERMO functionality.
 //!
 //! See `rusefi_wideband_can_protocol.md` for the rusEFI wideband protocol.
 
@@ -33,7 +33,7 @@ pub struct PluginContext<'a> {
     pub connected_interfaces: &'a [(u8, String)],
 }
 
-/// Trait for S.H.I.T plugins
+/// Trait for DERMO plugins
 ///
 /// Plugins can render UI windows and interact with CAN hardware
 /// through the provided PluginContext.

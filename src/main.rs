@@ -966,7 +966,7 @@ fn main() {
         default_hook(panic_info);
     }));
 
-    info!("S.H.I.T v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("DERMO v{} starting", env!("CARGO_PKG_VERSION"));
 
     // Create tokio runtime for async operations
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
@@ -978,7 +978,7 @@ fn main() {
     let (window, gl_config) = DisplayBuilder::new()
         .with_window_builder(Some(
             WindowBuilder::new()
-                .with_title("S.H.I.T - Signal Harvesting & Interpretation Toolkit")
+                .with_title("DERMO - CAN signal viewer and analyzer")
                 .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
         ))
         .build(&event_loop, glutin::config::ConfigTemplateBuilder::new()
@@ -1388,7 +1388,7 @@ fn main() {
                             state.show_shortcuts = true;
                         }
                         ui.separator();
-                        if ui.menu_item("About S.H.I.T") {
+                        if ui.menu_item("About DERMO") {
                             state.about_dialog.show();
                         }
                     });
@@ -1482,19 +1482,19 @@ fn main() {
                     let action = state.hardware_manager.render(&ui, &mut state.show_hardware_manager);
                     match action {
                         LiveModeAction::Connect { interface, config } => {
-                            info!("[S.H.I.T] Connect button clicked! Interface: {}, Bitrate: {}, Listen only: {}", interface, config.bitrate, config.listen_only);
+                            info!("[DERMO] Connect button clicked! Interface: {}, Bitrate: {}, Listen only: {}", interface, config.bitrate, config.listen_only);
 
                             // Determine interface type
                             let interface_type = if interface.starts_with("mock://") {
-                                info!("[S.H.I.T] Interface type: Virtual (mock)");
+                                info!("[DERMO] Interface type: Virtual (mock)");
                                 InterfaceType::Virtual
                             } else {
-                                info!("[S.H.I.T] Interface type: Serial");
+                                info!("[DERMO] Interface type: Serial");
                                 InterfaceType::Serial
                             };
 
                             // Connect to the CAN interface
-                            info!("[S.H.I.T] Calling can_collection.connect()...");
+                            info!("[DERMO] Calling can_collection.connect()...");
                             let result = rt.block_on(state.can_collection.connect(
                                 &interface,
                                 crate::hardware::can_interface::CanConfig {
@@ -1505,10 +1505,10 @@ fn main() {
                                 interface_type,
                             ));
 
-                            info!("[S.H.I.T] Connect result: {:?}", result);
+                            info!("[DERMO] Connect result: {:?}", result);
                             match result {
                                 Ok(bus_id) => {
-                                    info!("[S.H.I.T] Connecting as Bus {} (status will update when ready)...", bus_id);
+                                    info!("[DERMO] Connecting as Bus {} (status will update when ready)...", bus_id);
                                     state.status_message = Some(format!("Connecting to {} as Bus {}...", interface, bus_id));
                                     state.hardware_manager.state_mut().add_connected_interface(
                                         bus_id,
@@ -1517,7 +1517,7 @@ fn main() {
                                     );
                                 }
                                 Err(e) => {
-                                    error!("[S.H.I.T] Connection FAILED: {}", e);
+                                    error!("[DERMO] Connection FAILED: {}", e);
                                     state.status_message = Some(format!("Failed to connect: {}", e));
                                 }
                             }
@@ -1553,13 +1553,13 @@ fn main() {
                             let _ = rt.block_on(state.can_collection.send_to_bus(0, msg));
                         }
                         LiveModeAction::StartRecording => {
-                            info!("[S.H.I.T] Recording started");
+                            info!("[DERMO] Recording started");
                             state.status_message = Some("Recording started".to_string());
                         }
                         LiveModeAction::StopRecording => {
                             let live_state = state.hardware_manager.state();
                             let msg_count = live_state.live_messages.len();
-                            info!("[S.H.I.T] Recording stopped - {} messages captured", msg_count);
+                            info!("[DERMO] Recording stopped - {} messages captured", msg_count);
 
                             if !live_state.live_messages.is_empty() {
                                 // Convert live messages to CanMessage format and load into main state
@@ -1590,13 +1590,13 @@ fn main() {
                                     state.populate_chart_data();
                                 }
 
-                                info!("[S.H.I.T] Loaded {} recorded messages into playback", state.messages.len());
+                                info!("[DERMO] Loaded {} recorded messages into playback", state.messages.len());
                             }
 
                             state.status_message = Some(format!("Recording stopped - {} messages loaded into playback", msg_count));
                         }
                         LiveModeAction::SaveData => {
-                            info!("[S.H.I.T] Save data requested - {} messages", state.hardware_manager.state().live_messages.len());
+                            info!("[DERMO] Save data requested - {} messages", state.hardware_manager.state().live_messages.len());
                             // Save to CSV file
                             let live_state = state.hardware_manager.state();
                             if let Some(path) = crate::ui::FileDialogs::export_csv_file() {
@@ -1627,11 +1627,11 @@ fn main() {
                                                 rel_time, msg.id, msg.bus, data_hex);
                                         }
                                         state.status_message = Some(format!("Saved {} messages to {}", live_state.live_messages.len(), path.display()));
-                                        info!("[S.H.I.T] Saved {} messages to {}", live_state.live_messages.len(), path.display());
+                                        info!("[DERMO] Saved {} messages to {}", live_state.live_messages.len(), path.display());
                                     }
                                     Err(e) => {
                                         state.status_message = Some(format!("Failed to save: {}", e));
-                                        error!("[S.H.I.T] Failed to save: {}", e);
+                                        error!("[DERMO] Failed to save: {}", e);
                                     }
                                 }
                             }

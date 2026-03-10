@@ -1,6 +1,6 @@
 # BootCommander for F1 Wideband Flashing
 
-BootCommander (from [OpenBLT](https://github.com/feaser/openblt)) is required to flash firmware on F1 (STM32F103) wideband boards via XCP over CAN or RS232. The S.H.I.T wideband plugin uses it when you click "Flash via BootCommander (F1)...".
+BootCommander (from [OpenBLT](https://github.com/feaser/openblt)) is required to flash firmware on F1 (STM32F103) wideband boards via XCP over CAN or RS232. The DERMO wideband plugin uses it when you click "Flash via BootCommander (F1)...".
 
 ## Getting BootCommander
 
@@ -35,7 +35,7 @@ sudo apt-get install cmake build-essential libusb-1.0-0-dev
 
 If you have access to a Linux box, build there and copy the `BootCommander` binary (and `libopenblt.so`) to your Mac. Put them in a directory and add it to PATH.
 
-## Using BootCommander with S.H.I.T
+## Using BootCommander with DERMO
 
 Add the directory containing `BootCommander` to your PATH:
 

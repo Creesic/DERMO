@@ -1,8 +1,8 @@
 [package]
-name = "shit"
+name = "dermo"
 version = "0.1.53"
 edition = "2021"
-description = "Signal Harvesting & Interpretation Toolkit"
+description = "DERMO - CAN signal viewer and analyzer"
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
 
 [dependencies]

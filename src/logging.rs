@@ -24,7 +24,7 @@ pub fn log_buffer() -> Arc<Mutex<Vec<String>>> {
 pub fn log_file_path() -> Option<std::path::PathBuf> {
     dirs::data_local_dir()
         .or_else(dirs::config_dir)
-        .map(|p| p.join("can-viz").join("shit.log"))
+        .map(|p| p.join("can-viz").join("dermo.log"))
 }
 
 /// Initialize logging: stderr (console), file, and in-memory buffer.
