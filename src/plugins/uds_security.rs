@@ -42,7 +42,7 @@ impl Gen {
 fn compute_security_key(
     ecu_id: [u8; 2],
     seed: [u8; 8],
-    gen: Gen,
+    gen_type: Gen,
     n: &BigUint,
     e: &BigUint,
 ) -> Result<Vec<u8>, String> {
@@ -64,7 +64,7 @@ fn compute_security_key(
     let c = m.modpow(e, n);
 
     // 5. Convert to key_bytes (big-endian), pad if needed
-    let key_len = gen.key_bytes();
+    let key_len = gen_type.key_bytes();
     let mut raw = c.to_bytes_be();
     if raw.len() > key_len {
         return Err("RSA result too large".to_string());
@@ -81,7 +81,7 @@ fn compute_security_key(
 
     // 7. Prepend header
     let mut result = Vec::with_capacity(4 + key_len);
-    result.extend_from_slice(&gen.header());
+    result.extend_from_slice(&gen_type.header());
     result.extend(reversed);
 
     Ok(result)
@@ -90,7 +90,7 @@ fn compute_security_key(
 pub struct UdsSecurityPlugin {
     ecu_id: [u8; 2],
     seed: [u8; 8],
-    gen: Gen,
+    gen_type: Gen,
     rsa_n_hex: String,
     rsa_e_hex: String,
     computed_key: Option<Vec<u8>>,
@@ -107,7 +107,7 @@ impl UdsSecurityPlugin {
         Self {
             ecu_id: [0, 0],
             seed: [0, 0, 0, 0, 0, 0, 0, 0],
-            gen: Gen::Gen1,
+            gen_type: Gen::Gen1,
             rsa_n_hex: String::new(),
             rsa_e_hex: "10001".to_string(),
             computed_key: None,
@@ -192,7 +192,7 @@ impl UdsSecurityPlugin {
             }
         };
 
-        match compute_security_key(self.ecu_id, self.seed, self.gen, &n, &e) {
+        match compute_security_key(self.ecu_id, self.seed, self.gen_type, &n, &e) {
             Ok(key) => self.computed_key = Some(key),
             Err(e) => self.last_error = Some(e),
         }
@@ -345,10 +345,10 @@ impl Plugin for UdsSecurityPlugin {
 
                 ui.text("Gen:");
                 ui.same_line();
-                let mut gen_idx = if self.gen == Gen::Gen1 { 0 } else { 1 };
+                let mut gen_idx = if self.gen_type == Gen::Gen1 { 0 } else { 1 };
                 let gen_names = ["Gen1 (512-bit)", "Gen2 (1024-bit)"];
                 if ui.combo_simple_string("##gen", &mut gen_idx, &gen_names) {
-                    self.gen = if gen_idx == 0 { Gen::Gen1 } else { Gen::Gen2 };
+                    self.gen_type = if gen_idx == 0 { Gen::Gen1 } else { Gen::Gen2 };
                 }
 
                 ui.text("RSA n (hex):");

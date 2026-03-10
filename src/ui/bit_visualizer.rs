@@ -1021,7 +1021,7 @@ impl BitVisualizerWindow {
                         } else {
                             let physical_value = (raw_value_i64 as f64) * factor + offset;
                             // Numeric: pad to 10.3 + 4 for unit = fixed width
-                            let s = if let Some(ref u) = unit {
+                            let s = if let Some(u) = unit.as_ref() {
                                 if u.is_empty() {
                                     format!("{:>12.3}", physical_value)
                                 } else {
