@@ -978,7 +978,7 @@ fn main() {
     let (window, gl_config) = DisplayBuilder::new()
         .with_window_builder(Some(
             WindowBuilder::new()
-                .with_title("DERMO - CAN signal viewer and analyzer")
+                .with_title("DERMO - Data Extraction and Real-Time Message Observer")
                 .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
         ))
         .build(&event_loop, glutin::config::ConfigTemplateBuilder::new()

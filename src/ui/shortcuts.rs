@@ -447,7 +447,7 @@ impl AboutDialog {
                 ui.text("DERMO");
                 ui.text_colored([0.7, 0.7, 0.7, 1.0], "Version 0.1.0");
                 ui.separator();
-                ui.text("DERMO - CAN signal viewer and analyzer");
+                ui.text("DERMO - Data Extraction and Real-Time Message Observer");
                 ui.text("A cross-platform CAN bus visualization tool");
                 ui.text("similar to comma.ai's Cabana.");
                 ui.separator();

@@ -2,7 +2,7 @@
 name = "dermo"
 version = "0.1.53"
 edition = "2021"
-description = "DERMO - CAN signal viewer and analyzer"
+description = "DERMO - Data Extraction and Real-Time Message Observer"
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
 
 [dependencies]
