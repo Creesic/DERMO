@@ -7,11 +7,14 @@
 
 mod bench;
 mod gdi;
+mod isotp;
+mod uds_diag;
 mod uds_security;
 mod wideband;
 
 pub use bench::RusefiBenchPlugin;
 pub use gdi::RusefiGdiPlugin;
+pub use uds_diag::UdsDiagPlugin;
 pub use uds_security::UdsSecurityPlugin;
 pub use wideband::RusefiWidebandPlugin;
 
@@ -77,6 +80,7 @@ impl PluginRegistry {
         registry.register(Box::new(RusefiBenchPlugin::new()));
         registry.register(Box::new(RusefiGdiPlugin::new()));
         registry.register(Box::new(UdsSecurityPlugin::new()));
+        registry.register(Box::new(UdsDiagPlugin::new()));
         registry.register(Box::new(RusefiWidebandPlugin::new()));
         registry
     }

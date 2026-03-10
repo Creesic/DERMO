@@ -1,8 +1,8 @@
 [package]
 name = "dermo"
-version = "0.1.53"
+version = "0.1.56"
 edition = "2021"
-description = "DERMO - Data Extraction and Real-Time Message Observer"
+description = "Data Extraction and Real-Time Message Observer"
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
 
 [dependencies]
