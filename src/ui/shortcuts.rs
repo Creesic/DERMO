@@ -32,6 +32,8 @@ pub enum ShortcutAction {
     ClearData,
     SeekForward,
     SeekBackward,
+    ZoomIn,
+    ZoomOut,
     SpeedUp,
     SpeedDown,
     Quit,
@@ -125,6 +127,22 @@ impl ShortcutManager {
             description: "Seek Backward".to_string(),
         });
         self.register(Shortcut {
+            key: PhysicalKey::Code(KeyCode::ArrowUp),
+            ctrl: false,
+            shift: false,
+            alt: false,
+            action: ShortcutAction::ZoomIn,
+            description: "Zoom In".to_string(),
+        });
+        self.register(Shortcut {
+            key: PhysicalKey::Code(KeyCode::ArrowDown),
+            ctrl: false,
+            shift: false,
+            alt: false,
+            action: ShortcutAction::ZoomOut,
+            description: "Zoom Out".to_string(),
+        });
+        self.register(Shortcut {
             key: PhysicalKey::Code(KeyCode::Equal),
             ctrl: false,
             shift: false,
@@ -196,15 +214,19 @@ impl ShortcutManager {
             return None;
         }
 
+        self.action_for_key(event.physical_key, ctrl, shift, alt)
+    }
+
+    /// Get action for a key + modifiers (used for both key events and held-key polling)
+    pub fn action_for_key(&self, key: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> Option<ShortcutAction> {
         for shortcut in &self.shortcuts {
-            if shortcut.key == event.physical_key &&
+            if shortcut.key == key &&
                shortcut.ctrl == ctrl &&
                shortcut.shift == shift &&
                shortcut.alt == alt {
                 return Some(shortcut.action);
             }
         }
-
         None
     }
 
@@ -228,6 +250,8 @@ impl ShortcutManager {
                         ShortcutAction::Stop |
                         ShortcutAction::SeekForward |
                         ShortcutAction::SeekBackward |
+                        ShortcutAction::ZoomIn |
+                        ShortcutAction::ZoomOut |
                         ShortcutAction::SpeedUp |
                         ShortcutAction::SpeedDown => "Playback",
                         ShortcutAction::ToggleMessages |
@@ -425,11 +449,22 @@ pub struct ExportRequest {
 /// About dialog
 pub struct AboutDialog {
     show: bool,
+    logo_texture_id: Option<imgui::TextureId>,
+    logo_size: [f32; 2],
 }
 
 impl AboutDialog {
     pub fn new() -> Self {
-        Self { show: false }
+        Self {
+            show: false,
+            logo_texture_id: None,
+            logo_size: [0.0, 0.0],
+        }
+    }
+
+    pub fn set_logo(&mut self, texture_id: imgui::TextureId, width: f32, height: f32) {
+        self.logo_texture_id = Some(texture_id);
+        self.logo_size = [width, height];
     }
 
     pub fn show(&mut self) {
@@ -442,10 +477,14 @@ impl AboutDialog {
         }
 
         ui.window("About DERMO")
-            .size([400.0, 300.0], Condition::FirstUseEver)
+            .size([400.0, 320.0], Condition::FirstUseEver)
             .build(|| {
+                if let Some(tex_id) = self.logo_texture_id {
+                    let display_size = [self.logo_size[0].min(120.0), self.logo_size[1].min(120.0)];
+                    imgui::Image::new(tex_id, display_size).build(ui);
+                }
                 ui.text("DERMO");
-                ui.text_colored([0.7, 0.7, 0.7, 1.0], "Version 0.1.0");
+                ui.text_colored([0.7, 0.7, 0.7, 1.0], format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.separator();
                 ui.text("Data Extraction and Real-Time Message Observer");
                 ui.text("A cross-platform CAN bus visualization tool");

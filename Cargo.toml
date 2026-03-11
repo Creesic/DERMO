@@ -3,7 +3,7 @@ name = "dermo"
 version = "0.1.63"
 edition = "2021"
 description = "Data Extraction and Real-Time Message Observer"
-include = ["src/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
+include = ["src/**/*", "assets/**/*", "Cargo.toml", "Cargo.lock", "default_layout.ini"]
 
 [dependencies]
 # imgui and backends
@@ -42,6 +42,7 @@ md5 = "0.7"
 
 # utilities
 chrono = { version = "0.4", features = ["serde"] }
+image = "0.25"
 bzip2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -49,6 +50,11 @@ dirs = "5.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "3.3", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
 
 [features]
 default = []

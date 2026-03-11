@@ -1,5 +1,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "console")]
 
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn FreeConsole() -> i32;
+}
+
 mod core;
 mod decode;
 mod hardware;
@@ -16,14 +21,16 @@ use hardware::CanManagerCollection;
 use hardware::can_manager::ManagerMessage;
 use hardware::can_interface::InterfaceType;
 use plugins::{PluginContext, PluginRegistry};
-use ui::{MessageListWindow, FileDialogs, MultiSignalGraph, HardwareManagerWindow, LiveModeAction, LiveMessageWindow, MessageSenderWindow, MessageStatsWindow, PatternAnalyzerWindow, ShortcutManager, ExportDialog, AboutDialog, BitVisualizerWindow, SignalInfo, LogWindow};
+use ui::{MessageListWindow, FileDialogs, MultiSignalGraph, HardwareManagerWindow, LiveModeAction, LiveMessageWindow, MessageSenderWindow, MessageStatsWindow, PatternAnalyzerWindow, ShortcutManager, ShortcutAction, ExportDialog, AboutDialog, BitVisualizerWindow, SignalInfo, LogWindow};
 use ui::statistics::{MessageStatistics, PatternAnalyzer};
 use chrono::{DateTime, Duration, Utc};
 use imgui::{Context, FontConfig, FontSource, Condition};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
-use winit::event::{Event, WindowEvent};
+use winit::event::{Event, WindowEvent, KeyEvent, ElementState};
 use winit::event_loop::EventLoop;
-use winit::window::WindowBuilder;
+use winit::keyboard::{PhysicalKey, ModifiersState};
+use winit::window::{WindowBuilder, Icon};
+use std::collections::{HashSet, HashMap};
 
 use glutin::prelude::*;
 use glutin::display::GetGlDisplay;
@@ -974,13 +981,28 @@ fn main() {
     // Create event loop
     let event_loop = EventLoop::new().expect("Failed to create EventLoop");
 
+    // Load logo for window icon
+    let window_icon = {
+        let logo_bytes = include_bytes!("../assets/Dermologo.jpg");
+        if let Ok(img) = image::load_from_memory(logo_bytes) {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+        } else {
+            None
+        }
+    };
+
+    let mut window_builder = WindowBuilder::new()
+        .with_title("DERMO - Data Extraction and Real-Time Message Observer")
+        .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0));
+    if let Some(icon) = &window_icon {
+        window_builder = window_builder.with_window_icon(Some(icon.clone()));
+    }
+
     // Build the window and GL display using glutin-winit
     let (window, gl_config) = DisplayBuilder::new()
-        .with_window_builder(Some(
-            WindowBuilder::new()
-                .with_title("DERMO - Data Extraction and Real-Time Message Observer")
-                .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
-        ))
+        .with_window_builder(Some(window_builder))
         .build(&event_loop, glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(Some(true)), |mut iter| {
             iter.next().unwrap()
@@ -989,6 +1011,46 @@ fn main() {
 
     let window = window.expect("Failed to create window");
     let gl_display = gl_config.display();
+
+    // macOS: Pre-decode logo to RGBA for Dock icon (set in event loop when NSApplication is ready).
+    // 256px canvas with squircle mask.
+    #[cfg(target_os = "macos")]
+    let macos_dock_icon_rgba: Option<(Vec<u8>, u32, u32)> = {
+        image::load_from_memory(include_bytes!("../assets/Dermologo.jpg"))
+            .ok()
+            .map(|img| {
+                const SIZE: u32 = 256;
+                let scaled = img.thumbnail(SIZE, SIZE).to_rgba8();
+                let (sw, sh) = scaled.dimensions();
+                let ox = (SIZE - sw) / 2;
+                let oy = (SIZE - sh) / 2;
+                let mut buf = vec![0u8; (SIZE * SIZE * 4) as usize];
+                for y in 0..sh {
+                    for x in 0..sw {
+                        let src = ((y * sw + x) * 4) as usize;
+                        let dst = (((oy + y) * SIZE + (ox + x)) * 4) as usize;
+                        buf[dst..dst + 4].copy_from_slice(&scaled.as_raw()[src..src + 4]);
+                    }
+                }
+                // iOS/macOS squircle: superellipse |x/a|^5 + |y/b|^5 <= 1 (n=5)
+                // Transparent corners so Dock shows only the squircle shape
+                let half = SIZE as f32 / 2.0;
+                for y in 0..SIZE {
+                    for x in 0..SIZE {
+                        let xf = (x as f32 + 0.5 - half) / half;
+                        let yf = (y as f32 + 0.5 - half) / half;
+                        let v = xf.abs().powi(5) + yf.abs().powi(5);
+                        if v > 1.0 {
+                            let i = (y * SIZE + x) as usize * 4;
+                            buf[i + 3] = 0;
+                        }
+                    }
+                }
+                (buf, SIZE, SIZE)
+            })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let macos_dock_icon_rgba: Option<(Vec<u8>, u32, u32)> = None;
 
     // Create the context using the proper API
     let context = unsafe {
@@ -1097,8 +1159,42 @@ fn main() {
 
     // Create app state
     let mut state = AppState::new();
+
+    // Load logo texture for About dialog
+    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/Dermologo.jpg")) {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let gl_ctx = renderer.gl_context();
+        let gl_texture = unsafe { gl_ctx.create_texture() }.expect("create logo texture");
+        unsafe {
+            gl_ctx.bind_texture(glow::TEXTURE_2D, Some(gl_texture));
+            gl_ctx.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as _);
+            gl_ctx.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as _);
+            gl_ctx.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as _,
+                w as _,
+                h as _,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                Some(rgba.as_raw()),
+            );
+            gl_ctx.bind_texture(glow::TEXTURE_2D, None);
+        }
+        let tex_id = imgui::TextureId::new(gl_texture.0.get() as usize);
+        state.about_dialog.set_logo(tex_id, w as f32, h as f32);
+    }
+
     let mut last_frame_time = Instant::now();
     let mut last_settings_save = Instant::now();
+    let mut modifiers = ModifiersState::empty();
+    let mut held_keys: HashSet<PhysicalKey> = HashSet::new();
+    let mut key_hold_start: HashMap<PhysicalKey, Instant> = HashMap::new();
+    let mut last_zoom_time: Option<Instant> = None;
+    #[cfg(target_os = "macos")]
+    let mut macos_dock_icon_set = false;
 
     // Main loop
     event_loop.run(move |event, window_target| {
@@ -1109,6 +1205,52 @@ fn main() {
                 last_frame_time = now;
             }
             Event::AboutToWait => {
+                // macOS: Set Dock icon on first frame (NSApplication must be ready)
+                #[cfg(target_os = "macos")]
+                if !macos_dock_icon_set {
+                    macos_dock_icon_set = true;
+                    if let Some((ref rgba, w, h)) = macos_dock_icon_rgba {
+                        if let Some(mtm) = objc2::MainThreadMarker::new() {
+                            use objc2::AnyThread;
+                            use objc2_app_kit::{
+                                NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage,
+                            };
+                            use objc2_foundation::NSSize;
+
+                            let width = w as isize;
+                            let height = h as isize;
+                            let bytes_per_row = (w * 4) as isize;
+                            let mut planes: *mut u8 = rgba.as_ptr() as *mut u8;
+                            let image_rep = unsafe {
+                                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                                    NSBitmapImageRep::alloc(),
+                                    &mut planes,
+                                    width,
+                                    height,
+                                    8,
+                                    4,
+                                    true,
+                                    false,
+                                    NSDeviceRGBColorSpace,
+                                    bytes_per_row,
+                                    32,
+                                )
+                            };
+                            if let Some(image_rep) = image_rep {
+                                let app_icon = NSImage::initWithSize(
+                                    NSImage::alloc(),
+                                    NSSize::new(width as f64, height as f64),
+                                );
+                                app_icon.addRepresentation(&image_rep);
+                                let app = NSApplication::sharedApplication(mtm);
+                                unsafe { app.setApplicationIconImage(Some(&app_icon)); }
+                                let dock_tile = app.dockTile();
+                                unsafe { dock_tile.display(); }
+                            }
+                        }
+                    }
+                }
+
                 // Process file dialogs
                 state.process_file_dialogs();
                 state.process_savestate_save(&mut imgui);
@@ -1126,6 +1268,67 @@ fn main() {
 
                 // Update playback
                 state.playback.update(std::time::Duration::from_millis(16));
+
+                // Held-key scrubbing/zoom: step timeline or zoom while keys are held, with acceleration over 5s
+                if !imgui.io().want_capture_keyboard && state.file_loaded {
+                    let ctrl = modifiers.control_key();
+                    let shift = modifiers.shift_key();
+                    let alt = modifiers.alt_key();
+                    let now = Instant::now();
+                    let zoom_key_held = held_keys.iter().any(|k| {
+                        state.shortcut_manager.action_for_key(*k, ctrl, shift, alt)
+                            .map(|a| matches!(a, ShortcutAction::ZoomIn | ShortcutAction::ZoomOut))
+                            .unwrap_or(false)
+                    });
+                    if !zoom_key_held {
+                        last_zoom_time = None;
+                    }
+                    for key in &held_keys {
+                        let hold_secs = key_hold_start.get(key)
+                            .map(|t| (now - *t).as_secs_f32())
+                            .unwrap_or(0.0);
+                        // Scale from 1x at 0s to 10x at 5s (linear over 5 seconds)
+                        let multiplier = 1.0 + (hold_secs / 5.0).min(1.0) * 9.0;
+                        let steps = multiplier.round() as usize;
+
+                        if let Some(action) = state.shortcut_manager.action_for_key(*key, ctrl, shift, alt) {
+                            match action {
+                                ShortcutAction::SeekForward => {
+                                    for _ in 0..steps {
+                                        state.playback.step_forward();
+                                    }
+                                    state.seek_triggered_ui_update = true;
+                                }
+                                ShortcutAction::SeekBackward => {
+                                    for _ in 0..steps {
+                                        state.playback.step_back();
+                                    }
+                                    state.seek_triggered_ui_update = true;
+                                }
+                                ShortcutAction::ZoomIn => {
+                                    // Rate limit zoom: max 1 step every 120ms when held
+                                    let allow = last_zoom_time
+                                        .map(|t| now.duration_since(t).as_millis() >= 120)
+                                        .unwrap_or(true);
+                                    if allow {
+                                        state.charts.zoom_in();
+                                        last_zoom_time = Some(now);
+                                    }
+                                }
+                                ShortcutAction::ZoomOut => {
+                                    let allow = last_zoom_time
+                                        .map(|t| now.duration_since(t).as_millis() >= 120)
+                                        .unwrap_or(true);
+                                    if allow {
+                                        state.charts.zoom_out();
+                                        last_zoom_time = Some(now);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
 
                 // Update graphs with decoded signals
                 state.update_graphs();
@@ -1283,6 +1486,8 @@ fn main() {
                             ui.separator();
                         }
                         if ui.menu_item("Exit") {
+                            #[cfg(target_os = "windows")]
+                            unsafe { FreeConsole(); }
                             window_target.exit();
                         }
                     });
@@ -1903,6 +2108,8 @@ fn main() {
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 state.save_settings();
+                #[cfg(target_os = "windows")]
+                unsafe { FreeConsole(); }
                 window_target.exit();
             }
             Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
@@ -1919,6 +2126,44 @@ fn main() {
             Event::WindowEvent { event: WindowEvent::ScaleFactorChanged { scale_factor, .. }, .. } => {
                 // Update hidpi factor when moving between displays
                 hidpi_factor = scale_factor;
+            }
+            Event::WindowEvent { event: WindowEvent::ModifiersChanged(mods), .. } => {
+                modifiers = mods.state();
+            }
+            Event::WindowEvent { event: WindowEvent::KeyboardInput { ref event, .. }, .. } => {
+                let ctrl = modifiers.control_key();
+                let shift = modifiers.shift_key();
+                let alt = modifiers.alt_key();
+                match event.state {
+                    ElementState::Pressed => {
+                        let is_new = !held_keys.contains(&event.physical_key);
+                        held_keys.insert(event.physical_key);
+                        if is_new {
+                            key_hold_start.insert(event.physical_key, Instant::now());
+                        }
+                        if !imgui.io().want_capture_keyboard {
+                            if let Some(action) = state.shortcut_manager.action_for_key(event.physical_key, ctrl, shift, alt) {
+                                match action {
+                                    ShortcutAction::SeekForward => {
+                                        state.playback.step_forward();
+                                        state.seek_triggered_ui_update = true;
+                                    }
+                                    ShortcutAction::SeekBackward => {
+                                        state.playback.step_back();
+                                        state.seek_triggered_ui_update = true;
+                                    }
+                                    ShortcutAction::ZoomIn => state.charts.zoom_in(),
+                                    ShortcutAction::ZoomOut => state.charts.zoom_out(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        held_keys.remove(&event.physical_key);
+                        key_hold_start.remove(&event.physical_key);
+                    }
+                }
             }
             _ => {}
         }

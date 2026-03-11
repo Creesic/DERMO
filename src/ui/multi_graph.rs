@@ -170,6 +170,25 @@ impl MultiSignalGraph {
         self.seek_request.take()
     }
 
+    /// Zoom in (smaller time window, more detail)
+    pub fn zoom_in(&mut self) {
+        self.time_window_secs = (self.time_window_secs * 0.85).max(1.0);
+    }
+
+    /// Zoom out (larger time window, less detail)
+    pub fn zoom_out(&mut self) {
+        let max_secs = self.series.values()
+            .filter_map(|s| {
+                let first = s.data_points.first()?.1;
+                let last = s.data_points.last()?.1;
+                Some((last - first).num_seconds() as f32)
+            })
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(60.0)
+            .max(5.0);
+        self.time_window_secs = (self.time_window_secs * 1.18).min(max_secs);
+    }
+
     /// Take and clear any pending timeline action
     pub fn take_timeline_action(&mut self) -> Option<TimelineAction> {
         self.timeline_action.take()
@@ -321,13 +340,9 @@ impl MultiSignalGraph {
     /// Render the charts panel
     /// Shows a sliding time window around current_time.
     pub fn render(&mut self, ui: &Ui, current_time: Option<DateTime<Utc>>, _is_playing: bool) {
-        // Toolbar row 1: Add Signal, Clear All, Shared Y, Playback controls
-        if ui.small_button("+ Add Signal") {
+        // Toolbar: +, Shared Y, Play controls, Timeline slider, Window slider — all on one row
+        if ui.small_button("+") {
             self.show_signal_picker = !self.show_signal_picker;
-        }
-        ui.same_line();
-        if ui.small_button("Clear All") {
-            self.clear();
         }
         ui.same_line();
         let shared_count = self.shared_y_signals.len();
@@ -361,7 +376,7 @@ impl MultiSignalGraph {
             }
         }
         ui.same_line();
-        ui.text("    ");  // spacing
+        ui.text("    ");
         ui.same_line();
         if ui.small_button("<<") {
             self.timeline_action = Some(TimelineAction::StepBack);
@@ -374,10 +389,19 @@ impl MultiSignalGraph {
         if ui.small_button(">>") {
             self.timeline_action = Some(TimelineAction::StepForward);
         }
+        ui.same_line();
+        ui.text("    ");
 
-        ui.spacing();
+        // Sliders on same row — use window right edge for sizing so they don't overflow
+        let content_max = ui.window_content_region_max();
+        let cursor = ui.cursor_pos();
+        let avail = (content_max[0] - cursor[0] - 8.0).max(80.0);  // 8px padding from right edge
+        let timeline_width = avail * 0.70;
+        let window_width = avail * 0.30;
 
-        // Timeline scrubber (full width) - using overall data time range
+        ui.same_line();
+
+        // Timeline scrubber - using overall data time range
         if let (Some(data_start), Some(data_end)) = (self.data_start_time, self.data_end_time) {
             let total_duration_secs = (data_end - data_start).num_seconds() as f32;
             let total_duration_secs = total_duration_secs.max(5.0);
@@ -386,9 +410,7 @@ impl MultiSignalGraph {
                 let current_offset = (ct - data_start).num_seconds() as f32;
                 let timeline_pos = (current_offset / total_duration_secs).clamp(0.0, 1.0);
 
-                let slider_width = ui.content_region_avail()[0];
-
-                if let Some(new_pos) = self.timeline_slider_widget(ui, "##timeline_slider", timeline_pos, total_duration_secs, slider_width) {
+                if let Some(new_pos) = self.timeline_slider_widget(ui, "##timeline_slider", timeline_pos, total_duration_secs, timeline_width) {
                     // Handle timeline scrubbing - use RELATIVE seek like the chart does
                     let new_offset = new_pos * total_duration_secs;
                     let target_time = data_start + Duration::seconds(new_offset as i64);
@@ -399,9 +421,9 @@ impl MultiSignalGraph {
             }
         }
 
-        ui.spacing();
+        ui.same_line();
 
-        // Zoom slider (full width) — use first()/last() since data is time-sorted
+        // Zoom slider — use first()/last() since data is time-sorted
         let recording_duration_secs = {
             let mut earliest = None::<DateTime<Utc>>;
             let mut latest = None::<DateTime<Utc>>;
@@ -419,8 +441,7 @@ impl MultiSignalGraph {
             }
         }.max(5.0); // Minimum 5 second recording
 
-        let slider_width = ui.content_region_avail()[0];
-        self.log_slider_widget_full_width(ui, "##time_window_slider", 1.0, recording_duration_secs, slider_width);
+        self.log_slider_widget_full_width(ui, "##time_window_slider", 1.0, recording_duration_secs, window_width);
 
         // Signal picker popup
         if self.show_signal_picker {
@@ -1037,6 +1058,12 @@ impl MultiSignalGraph {
             }
         }
 
+        // Faded label on the left
+        let label_text = "Timeline";
+        let mut label_color = style.colors[imgui::StyleColor::Text as usize];
+        label_color[3] *= 0.45;
+        draw_list.add_text([bg_min[0] + 6.0, bg_min[1] + 1.0], label_color, label_text);
+
         // Draw value text inside the slider (at the right side) - show current time in seconds
         let current_seconds = current_pos * total_duration_secs;
         let value_text = format!("{:.0}s", current_seconds);
@@ -1122,6 +1149,12 @@ impl MultiSignalGraph {
             self.time_window_secs = new_log_value.exp();
             changed = true;
         }
+
+        // Faded label on the left
+        let label_text = "Window";
+        let mut label_color = style.colors[imgui::StyleColor::Text as usize];
+        label_color[3] *= 0.45;
+        draw_list.add_text([bg_min[0] + 6.0, bg_min[1] + 1.0], label_color, label_text);
 
         // Draw value text inside the slider (at the right side)
         let value_text = format!("{}s", self.time_window_secs.round() as i32);
